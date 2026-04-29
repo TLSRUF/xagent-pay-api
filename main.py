@@ -65,7 +65,7 @@ if not all([SENDER_ADDRESS, SENDER_SECRET, FEE_ACCOUNT]):
 
 # API 키 검증
 if not API_KEYS:
-    print("⚠️  경고: API_KEYS가 설정되지 않았습니다. .env 파일에 API_KEYS를 설정해주세요.")
+    print("경고: API_KEYS가 설정되지 않았습니다. .env 파일에 API_KEYS를 설정해주세요.")
 
 # 폴더 생성
 Path("logs").mkdir(exist_ok=True)
