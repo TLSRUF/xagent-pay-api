@@ -261,4 +261,4 @@ MIT License
 
 ---
 
-문의: [GitHub Issues](https://github.com/your-repo/xrpl-mvp/issues)
+문의: [GitHub Issues](https://github.com/TLSRUF/xagent-pay-api/issues)

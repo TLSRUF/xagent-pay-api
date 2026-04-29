@@ -29,7 +29,10 @@
       "Bash(git commit *)",
       "Bash(grep -E \"\\\\.env$|logs/|usage/\")",
       "Bash(grep -E \"\\\\.env$|logs|usage\")",
-      "Bash(git rm *)"
+      "Bash(git rm *)",
+      "Bash(git branch *)",
+      "Bash(git remote *)",
+      "Bash(git push *)"
     ]
   }
 }

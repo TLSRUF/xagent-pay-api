@@ -261,4 +261,4 @@ This project is managed on GitHub. Please submit bug reports and feature request
 
 ---
 
-Contact: [GitHub Issues](https://github.com/your-repo/xrpl-mvp/issues)
+Contact: [GitHub Issues](https://github.com/TLSRUF/xagent-pay-api/issues)
