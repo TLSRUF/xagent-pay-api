@@ -8,8 +8,8 @@
 ### 리모트 등록 및 푸시
 
 ```bash
-# 리모트 추가 (your-username 부분을 본인 GitHub 아이디로 변경)
-git remote add origin https://github.com/your-username/xagent-pay-api.git
+# 리모트 추가
+git remote add origin https://github.com/TLSRUF/xagent-pay-api.git
 
 # 메인 브랜치 푸시
 git push -u origin master
