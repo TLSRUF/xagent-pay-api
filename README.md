@@ -235,6 +235,40 @@ curl -X POST "http://localhost:8000/payment/create" \
 - 수수료: 1 (해당 통화)
 - 전송금액: 99 (해당 통화)
 
+## Claude MCP 연동
+
+Claude AI가 XAgent Pay API를 직접 툴로 호출할 수 있습니다.
+
+### 설치
+
+mcp_server.py를 Claude Desktop 설정에 추가:
+
+```json
+{
+  "mcpServers": {
+    "xagent-pay-api": {
+      "command": "python",
+      "args": ["/path/to/mcp_server.py"]
+    }
+  }
+}
+```
+
+### 사용 가능한 툴
+
+- **get_rates**: 지원 통화 및 수수료 조회
+- **create_payment**: XRP/RLUSD 결제 생성
+- **verify_payment**: 트랜잭션 검증
+- **check_trustline**: RLUSD Trust Line 확인
+
+### 데모
+
+Claude AI가 직접 1 XRP 송금한 실제 결과:
+- 수신 주소: rM9SpkNUPUygwTcE7baTYTeZWP6BwhKePK
+- 실제 송금액: 0.99 XRP
+- 수수료: 0.01 XRP (1%)
+- TX 해시: CB2AC710B2EA8E335FB7EBEB258306CE96C30C0F09ABD728087C6099AC28D9AB
+
 ## 로드맵
 
 - [x] x402 토큰 지원
