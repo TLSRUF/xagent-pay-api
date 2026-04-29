@@ -75,70 +75,13 @@ async def call_xagent_api(
 
 
 @server.list_tools()
-async def handle_list_tools() -> list[dict]:
+async def handle_list_tools() -> list[str]:
     """사용 가능한 MCP 툴 목록 반환"""
     return [
-        {
-            "name": "create_payment",
-            "description": "XRP 또는 RLUSD 결제 생성. 수신자 주소, 금액, 통화를 받아 결제를 생성합니다.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "recipient_address": {
-                        "type": "string",
-                        "description": "수신자 XRP 주소 (r로 시작)"
-                    },
-                    "amount": {
-                        "type": "number",
-                        "description": "전송 금액 (통화 단위)"
-                    },
-                    "currency": {
-                        "type": "string",
-                        "enum": ["XRP", "RLUSD"],
-                        "description": "통화 종류",
-                        "default": "XRP"
-                    }
-                },
-                "required": ["recipient_address", "amount"]
-            }
-        },
-        {
-            "name": "verify_payment",
-            "description": "결제 트랜잭션 검증. 트랜잭션 해시로 결제 성공/실패 여부를 확인합니다.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tx_hash": {
-                        "type": "string",
-                        "description": "검증할 트랜잭션 해시"
-                    }
-                },
-                "required": ["tx_hash"]
-            }
-        },
-        {
-            "name": "check_trustline",
-            "description": "RLUSD Trust Line 확인. 특정 주소가 RLUSD를 받을 수 있는지 확인합니다.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "address": {
-                        "type": "string",
-                        "description": "확인할 XRP 주소"
-                    }
-                },
-                "required": ["address"]
-            }
-        },
-        {
-            "name": "get_rates",
-            "description": "지원 통화 및 수수료 정보 조회. 현재 지원하는 통화와 수수료율을 반환합니다.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
+        "create_payment",
+        "verify_payment",
+        "check_trustline",
+        "get_rates"
     ]
 
 
