@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -m pip install -r requirements.txt)",
+      "Bash(python main.py)",
+      "Bash(python -c \"import uvicorn; uvicorn.run\\('main:app', host='0.0.0.0', port=8000, log_level='debug'\\)\")",
+      "Bash(curl http://localhost:8000/health)",
+      "Bash(curl http://localhost:8000/)",
+      "Bash(curl -X POST \"http://localhost:8000/payment/create\" -H \"Content-Type: application/json\" -d \"{\\\\\"recipient_address\\\\\": \\\\\"rtest1234567890abcdefghijklmnopqrstuvwxyz\\\\\", \\\\\"amount\\\\\": 10.0}\")",
+      "Bash(python -c \"import xrpl; help\\(xrpl.clients.WebsocketClient\\)\")",
+      "Bash(curl -X POST \"http://localhost:8000/payment/create\" -H \"Content-Type: application/json\" -d \"{\\\\\"recipient_address\\\\\": \\\\\"rLFKMPJvVZwPWDaahAyZLJLZZkAgDX8tZK\\\\\", \\\\\"amount\\\\\": 5.0}\")",
+      "Bash(python -c \"import xrpl; print\\(dir\\(xrpl\\)\\)\" | grep -i submit)",
+      "Bash(python -c \"from xrpl import transaction; print\\([x for x in dir\\(transaction\\) if 'submit' in x.lower\\(\\)]\\)\")",
+      "Bash(curl -X POST \"http://localhost:8000/payment/create\" -H \"Content-Type: application/json\" -d \"{\\\\\"recipient_address\\\\\": \\\\\"rM9SpkNUPUygwTcE7baTYTeZWP6BwhKePK\\\\\", \\\\\"amount\\\\\": 5.0}\")",
+      "Bash(python -c \"from xrpl.transaction import autofill_and_sign; help\\(autofill_and_sign\\)\" | head -20)",
+      "Bash(python -c \"from xrpl.transaction import submit; help\\(submit\\)\" | head -30)",
+      "Bash(curl \"http://localhost:8000/payment/verify/1362661D5F1DF948CE2BA9120763A32BD4500BDA8F98DAD496B63ABA8421917C\")",
+      "Bash(curl \"http://localhost:8000/payment/status/1362661D5F1DF948CE2BA9120763A32BD4500BDA8F98DAD496B63ABA8421917C\")",
+      "Bash(curl -X GET \"http://localhost:8000/payment/verify/1362661D5F1DF948CE2BA9120763A32BD4500BDA8F98DAD496B63ABA8421917C\")",
+      "Bash(curl -X GET \"http://localhost:8000/payment/verify/1362661D5F1DF948CE2BA9120763A32BD4500BDA8F98DAD496B63ABA8421917C\" -H \"X-API-Key: wrong_key_123\")",
+      "Bash(curl -X GET \"http://localhost:8000/payment/verify/1362661D5F1DF948CE2BA9120763A32BD4500BDA8F98DAD496B63ABA8421917C\" -H \"X-API-Key: test_key_123456\")",
+      "Bash(curl \"http://localhost:8000/usage/info\" -H \"X-API-Key: test_key_123456\")",
+      "Bash(curl -X POST \"http://localhost:8000/payment/create\" -H \"Content-Type: application/json\" -H \"X-API-Key: test_key_123456\" -d \"{\\\\\"recipient_address\\\\\": \\\\\"rM9SpkNUPUygwTcE7baTYTeZWP6BwhKePK\\\\\", \\\\\"amount\\\\\": 2.0}\")",
+      "Bash(python *)",
+      "Bash(curl *)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}
