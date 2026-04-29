@@ -248,7 +248,11 @@ mcp_server.py를 Claude Desktop 설정에 추가:
   "mcpServers": {
     "xagent-pay-api": {
       "command": "python",
-      "args": ["/path/to/mcp_server.py"]
+      "args": ["/path/to/mcp_server.py"],
+      "env": {
+        "XAGENT_PAY_API_URL": "http://localhost:8000",
+        "MCP_API_KEY": "your_api_key"
+      }
     }
   }
 }
