@@ -284,7 +284,7 @@ Add the following to your Claude Desktop configuration file:
       "args": ["C:/XRPL_MVP/mcp_server.py"],
       "env": {
         "XAGENT_PAY_API_URL": "http://localhost:8000",
-        "MCP_API_KEY": "test_key_123456"
+        "MCP_API_KEY": "your_api_key"
       }
     }
   }
