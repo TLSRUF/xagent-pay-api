@@ -1,19 +1,38 @@
-# Python
+# 환경변수 파일
+.env
+.env.local
+
+# Python 관련
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-venv/
-env/
-ENV/
-*.egg-info/
-dist/
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Environment variables
-.env
-.env.local
+# 가상환경
+venv/
+ENV/
+env/
+
+# 프로젝트 로그 및 데이터
+logs/
+usage/
+*.log
 
 # IDE
 .vscode/
@@ -26,10 +45,5 @@ build/
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
+# Claude Code
+.claude/
