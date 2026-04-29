@@ -1,6 +1,6 @@
 # XAgent Pay API
 
-AI 에이전트와 개발자를 위한 한국 최초 XRPL 결제 API
+AI 에이전트와 개발자를 위한 XRPL 결제 API
 
 ## 소개
 
