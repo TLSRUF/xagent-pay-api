@@ -239,10 +239,73 @@ curl -X POST "http://localhost:8000/payment/create" \
 
 - [x] x402 token support
 - [x] RLUSD (stablecoin) support
+- [x] MCP server support (Claude AI integration)
 - [ ] Additional IOU token support
 - [ ] Mainnet deployment
 - [ ] Webhook notifications
 - [ ] Batch payments
+
+## MCP Server (Claude AI Integration)
+
+XAgent Pay API provides an MCP server that enables Claude AI to directly use payment tools.
+
+### Installation and Setup
+
+```bash
+# Install MCP package
+pip install -r requirements.txt
+
+# Add MCP API key to .env file
+MCP_API_KEY=test_key_123456
+```
+
+### Running MCP Server
+
+```bash
+# Start XAgent Pay API server
+python main.py
+
+# Start MCP server (in separate terminal)
+python mcp_server.py
+```
+
+### Claude Desktop Configuration
+
+Add the following to your Claude Desktop configuration file:
+
+**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows:** `%APPDATA%/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "xagent-pay-api": {
+      "command": "python",
+      "args": ["C:/XRPL_MVP/mcp_server.py"],
+      "env": {
+        "XAGENT_PAY_API_URL": "http://localhost:8000",
+        "MCP_API_KEY": "test_key_123456"
+      }
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+1. **create_payment** - Create XRP/RLUSD payment
+2. **verify_payment** - Verify payment transaction
+3. **check_trustline** - Check RLUSD Trust Line
+4. **get_rates** - Get supported currencies and fee info
+
+### Usage Examples in Claude
+
+```
+"Send 100 XRP to rAddress..."
+"Verify the latest payment"
+"Check RLUSD trust line"
+"What currencies and fees do you support?"
+```
 
 ## Security
 
