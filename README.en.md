@@ -256,7 +256,7 @@ XAgent Pay API provides an MCP server that enables Claude AI to directly use pay
 pip install -r requirements.txt
 
 # Add MCP API key to .env file
-MCP_API_KEY=test_key_123456
+MCP_API_KEY=your_api_key
 ```
 
 ### Running MCP Server
