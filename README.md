@@ -255,6 +255,10 @@ curl -X POST "http://localhost:8000/payment/create" \
 
 MIT License
 
+## GitHub 리포지토리
+
+이 프로젝트는 GitHub에서 관리됩니다. 버그 신고 및 기능 요청은 Issues를 통해 제출해주세요.
+
 ---
 
 문의: [GitHub Issues](https://github.com/your-repo/xrpl-mvp/issues)
