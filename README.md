@@ -67,7 +67,7 @@ curl -X POST "http://localhost:8000/payment/create" \
   }'
 ```
 
-⚠️ **RLUSD 결제 전 주의사항:** 수신자가 먼저 RLUSD 토큰에 대한 trust line을 설정해야 합니다.
+**RLUSD 결제 전 주의사항:** 수신자가 먼저 RLUSD 토큰에 대한 trust line을 설정해야 합니다.
 
 **Response:**
 ```json
@@ -237,8 +237,8 @@ curl -X POST "http://localhost:8000/payment/create" \
 
 ## 로드맵
 
-- [x] x402 토큰 지원 ✅
-- [x] RLUSD(스테이블코인) 지원 ✅
+- [x] x402 토큰 지원
+- [x] RLUSD(스테이블코인) 지원
 - [ ] 추가 IOU 토큰 지원
 - [ ] 메인넷 배포
 - [ ] 웹훅 알림
@@ -246,7 +246,7 @@ curl -X POST "http://localhost:8000/payment/create" \
 
 ## 보안
 
-⚠️ **현재 테스트넷 전용**입니다. 메인넷 사용 시 보안 강화가 필요합니다:
+**현재 테스트넷 전용**입니다. 메인넷 사용 시 보안 강화가 필요합니다:
 - 인증/인가 시스템
 - Rate Limiting
 - 시크릿 키 암호화 저장

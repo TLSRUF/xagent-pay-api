@@ -67,7 +67,7 @@ curl -X POST "http://localhost:8000/payment/create" \
   }'
 ```
 
-⚠️ **Before RLUSD Payment:** Recipient must set up a trust line for RLUSD tokens first.
+**Before RLUSD Payment:** Recipient must set up a trust line for RLUSD tokens first.
 
 **Response:**
 ```json
@@ -237,8 +237,8 @@ curl -X POST "http://localhost:8000/payment/create" \
 
 ## Roadmap
 
-- [x] x402 token support ✅
-- [x] RLUSD (stablecoin) support ✅
+- [x] x402 token support
+- [x] RLUSD (stablecoin) support
 - [ ] Additional IOU token support
 - [ ] Mainnet deployment
 - [ ] Webhook notifications
@@ -246,7 +246,7 @@ curl -X POST "http://localhost:8000/payment/create" \
 
 ## Security
 
-⚠️ **Currently testnet-only.** Mainnet deployment requires security hardening:
+**Currently testnet-only.** Mainnet deployment requires security hardening:
 - Authentication/authorization system
 - Rate limiting
 - Encrypted secret key storage
