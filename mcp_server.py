@@ -256,24 +256,15 @@ async def handle_call_tool(name: str, arguments: dict) -> list[dict]:
 
 async def main():
     """MCP 서버 메인 함수"""
-    # 서버 초기화
-    await server.start(
-        initialization_options=InitializationOptions(
-            server_name="xagent-pay-api",
-            server_version="1.0.0",
-            capabilities=server.get_capabilities(
-                notification_options=NotificationOptions(),
-                experimental_capabilities={}
-            )
-        )
-    )
+    # 서버 실행 옵션 설정
+    options = server.create_initialization_options()
 
     # stdio 서버 실행
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
-            server.create_initialization_options()
+            options
         )
 
 
