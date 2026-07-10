@@ -6,40 +6,118 @@ AI 에이전트와 개발자를 위한 XRPL 결제 API
 
 FastAPI 기반의 XRPL(XRP Ledger) 테스트넷 결제 서버입니다. 복잡한 블록체인 로직을 추상화하여 AI 에이전트와 애플리케이션이 XRP 및 RLUSD 결제를 손쉽게 통합할 수 있습니다.
 
-**지원 통화:** XRP, RLUSD (스테이블코인)
+- **지원 통화:** XRP, RLUSD (스테이블코인)
+- **인증:** 발급/폐기 가능한 API 키, tier별 요금·한도
+- **지갑:** API 키 발급 시 전용 XRPL 지갑 자동 생성/펀딩 (에이전트별 분리 운용)
+- **관측:** 사용량 대시보드(웹 UI), 트랜잭션 내역, 누적 수수료 조회
+- **알림:** 결제 성공/실패 시 Webhook 콜백 (서명 검증 + 재시도)
 
-## 설치
+## 빠른 시작
 
 ```bash
-# 의존성 설치
+# 1. 저장소 클론 & 의존성 설치
 pip install -r requirements.txt
 
-# 환경변수 설정 (.env 파일)
-SENDER_ADDRESS=테스트넷_XRP_주소
+# 2. .env 파일 생성 (.env.example 복사 후 값 입력)
+cp .env.example .env
+```
+
+`.env`에 최소한 아래 값을 채워야 서버가 기동됩니다:
+
+```bash
+SENDER_ADDRESS=테스트넷_XRP_주소       # 플랫폼 공용 지갑 (레거시 키 폴백용)
 SENDER_SECRET=시크릿_키
 FEE_ACCOUNT=수수료_수신_주소
 XRPL_NODE=wss://s.altnet.rippletest.net:51233
-RLUSD_ISSUER=rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De
+ADMIN_API_KEY=강력한_관리자_키          # API 키 발급/폐기용 (없으면 /admin/keys 비활성화)
 ```
 
-테스트넷 계정: [XRPL Faucet](https://xrpl.org/xrp-testnet-faucet.html)
-
-## 실행
+테스트넷 계정이 없다면 [XRPL Faucet](https://xrpl.org/xrp-testnet-faucet.html)에서 발급받으세요.
 
 ```bash
-# 개발 모드
+# 3. 서버 실행
 python main.py
+# 또는
+uvicorn main:app --host 0.0.0.0 --port 8000
 
-# 프로덕션
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+# 프로덕션 (단, 아래 "알려진 제한사항" 참고 — 현재는 단일 워커 기준으로 설계됨)
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 - API: http://localhost:8000
 - Swagger 문서: http://localhost:8000/docs
+- 사용량 대시보드: http://localhost:8000/dashboard
 
-## API 사용법
+```bash
+# 4. 첫 API 키 발급 (관리자 키로 1회 실행)
+curl -X POST "http://localhost:8000/admin/keys" \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: your_admin_key" \
+  -d '{"name": "my-first-agent", "tier": "free"}'
+```
 
-모든 요청은 API 키 인증이 필요합니다. 헤더에 `X-API-Key`를 포함해야 합니다.
+응답으로 받은 `api_key`가 이후 모든 요청에 쓸 `X-API-Key` 값입니다. **이 응답에서만 평문으로 확인 가능**하니 안전한 곳에 보관하세요. 같은 응답의 `wallet_address`는 이 키 전용으로 자동 생성/펀딩된 지갑 주소입니다.
+
+## 가격 정책
+
+| Tier | 가격 | 월 요청 한도 | 결제 수수료율 |
+|---|---|---|---|
+| Free | $0 | 100건 | 1% |
+| Pro | $49/월 | 무제한 | 0.15% |
+| Enterprise | 커스텀 | 무제한 | 커스텀 협의 (볼륨에 따라 조정) |
+
+- Pro의 $49/월 구독료는 이 API가 직접 처리하지 않습니다 (별도 SaaS 과금 레이어에서 처리).
+- 이 API가 실제로 적용하는 것은 **결제 트랜잭션당 수수료율**뿐입니다.
+- Enterprise는 키 발급 시 `fee_rate`를 지정해 tier 기본값을 덮어쓸 수 있습니다.
+- 현재 적용 중인 tier별 요율은 `GET /payment/rates`에서 언제든 확인할 수 있습니다.
+
+## 인증 — API 키 발급/조회/폐기
+
+키 발급·폐기는 관리자 전용(`X-Admin-Key` 헤더)이고, 그 외 모든 API는 발급받은 키(`X-API-Key` 헤더)로 호출합니다.
+
+```bash
+# 키 발급 (전용 지갑 자동 생성 포함)
+curl -X POST "http://localhost:8000/admin/keys" \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: your_admin_key" \
+  -d '{"name": "customer-a-bot", "tier": "pro"}'
+
+# 키 목록 조회 (평문 키는 노출되지 않음)
+curl "http://localhost:8000/admin/keys" -H "X-Admin-Key: your_admin_key"
+
+# 키 폐기
+curl -X POST "http://localhost:8000/admin/keys/{key_id}/revoke" \
+  -H "X-Admin-Key: your_admin_key"
+```
+
+| 코드 | 설명 |
+|------|------|
+| 401 | API 키 없음 |
+| 403 | API 키가 유효하지 않거나 폐기됨 |
+| 429 | tier 월간 한도 초과 |
+| 503 | `ADMIN_API_KEY` 미설정으로 관리자 API 비활성화 |
+
+## 지갑 관리 (멀티 에이전트)
+
+API 키를 발급하면 XRPL 테스트넷 faucet으로 **전용 지갑이 자동 생성/펀딩**됩니다. 이후 그 키로 실행하는 모든 결제는 플랫폼 공용 지갑이 아니라 **키 전용 지갑**에서 나갑니다 — 여러 에이전트가 동시에 결제해도 지갑(=XRPL 시퀀스 번호)이 분리되어 있어 충돌하지 않습니다.
+
+```bash
+curl "http://localhost:8000/wallet/info" -H "X-API-Key: your_api_key"
+```
+
+```json
+{
+  "wallet_address": "r...",
+  "balance_xrp": 998.5,
+  "dedicated": true
+}
+```
+
+`dedicated: false`이면 전용 지갑 생성/펀딩에 실패했거나(테스트넷 faucet rate limit 등) `.env`의 `API_KEYS`로 마이그레이션된 레거시 키라 플랫폼 공용 지갑을 공유하는 상태입니다.
+
+## 결제 API
+
+모든 결제 API는 `X-API-Key` 헤더가 필요합니다.
 
 ### 결제 생성
 
@@ -67,39 +145,33 @@ curl -X POST "http://localhost:8000/payment/create" \
   }'
 ```
 
-**RLUSD 결제 전 주의사항:** 수신자가 먼저 RLUSD 토큰에 대한 trust line을 설정해야 합니다.
+⚠️ **RLUSD 결제 전 주의사항:** 수신자가 먼저 RLUSD 토큰에 대한 trust line을 설정해야 합니다.
 
-**Response:**
+**Response:** (수수료율은 API 키 tier에 따라 달라집니다 — 아래는 Pro tier 예시)
 ```json
 {
   "success": true,
   "tx_hash": "트랜잭션_해시",
-  "fee_amount": 0.1,
-  "sent_amount": 9.9
+  "fee_amount": 0.015,
+  "fee_rate": 0.0015,
+  "sent_amount": 9.985,
+  "remaining_quota": null
 }
 ```
 
-### 결제 검증
+### 결제 검증 / 상태 조회
 
 ```bash
-curl "http://localhost:8000/payment/verify/{tx_hash}" \
-  -H "X-API-Key: your_api_key"
+curl "http://localhost:8000/payment/verify/{tx_hash}" -H "X-API-Key: your_api_key"
+curl "http://localhost:8000/payment/status/{tx_hash}" -H "X-API-Key: your_api_key"
 ```
 
-### 상태 조회
-
-```bash
-curl "http://localhost:8000/payment/status/{tx_hash}" \
-  -H "X-API-Key: your_api_key"
-```
-
-### 지원 통화 확인
+### 지원 통화 및 수수료율 확인 (인증 불필요)
 
 ```bash
 curl "http://localhost:8000/payment/rates"
 ```
 
-**Response:**
 ```json
 {
   "supported_currencies": {
@@ -107,11 +179,63 @@ curl "http://localhost:8000/payment/rates"
     "RLUSD": {"currency": "RLUSD", "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De", "scale": 5}
   },
   "default_currency": "XRP",
-  "fee_rate": 0.01
+  "fee_rates_by_tier": {"free": 0.01, "pro": 0.0015, "enterprise": 0.0015}
 }
 ```
 
-### x402 결제
+## 사용량 대시보드
+
+브라우저에서 http://localhost:8000/dashboard 를 열고 API 키를 입력하면 tier, 이번 달 요청 수/남은 quota, 통화별 누적 수수료, 최근 트랜잭션 내역, 지갑 주소/잔액을 한 화면에서 확인할 수 있습니다.
+
+같은 데이터를 API로도 조회 가능합니다:
+
+```bash
+# quota + 누적 수수료 + 최근 트랜잭션 (대시보드 페이지가 호출하는 것과 동일)
+curl "http://localhost:8000/usage/dashboard" -H "X-API-Key: your_api_key"
+
+# 트랜잭션 내역만
+curl "http://localhost:8000/usage/transactions?limit=50" -H "X-API-Key: your_api_key"
+
+# quota만
+curl "http://localhost:8000/usage/info" -H "X-API-Key: your_api_key"
+```
+
+## Rate Limiting
+
+- **Free:** 월 100건 초과 시 `429 Too Many Requests`
+- **Pro / Enterprise:** 무제한 (요청 수 기준 제한 없음, 수수료로 과금)
+- 한도는 `FREE_MONTHLY_LIMIT` 환경변수로 조정 가능
+
+## Webhook 알림
+
+결제 성공(`payment.success`) / 실패(`payment.failed`) 시 지정한 URL로 이벤트를 전송합니다. 실패하면 2초·10초·60초 간격으로 최대 3회 재시도합니다.
+
+```bash
+# 등록 (등록할 때마다 서명 secret이 새로 발급되며, 이 응답에서만 확인 가능)
+curl -X PUT "http://localhost:8000/webhook" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your_api_key" \
+  -d '{"url": "https://your-server.com/xagent-webhook"}'
+
+# 조회
+curl "http://localhost:8000/webhook" -H "X-API-Key: your_api_key"
+
+# 삭제
+curl -X DELETE "http://localhost:8000/webhook" -H "X-API-Key: your_api_key"
+```
+
+수신 서버에서는 `X-XAgent-Signature: sha256=<hmac>` 헤더로 위변조 여부를 검증하세요:
+
+```python
+import hmac, hashlib
+
+expected = hmac.new(webhook_secret.encode(), request_body, hashlib.sha256).hexdigest()
+is_valid = hmac.compare_digest(expected, received_signature.removeprefix("sha256="))
+```
+
+내부/사설 IP(localhost, 사내망 등)는 SSRF 방지를 위해 webhook URL로 등록할 수 없습니다.
+
+## x402 결제
 
 AI 에이전트를 위한 HTTP 402 Payment Required 표준 지원
 
@@ -133,20 +257,6 @@ curl -X POST "http://localhost:8000/x402/pay" \
 curl "http://localhost:8000/data/market-info" \
   -H "X-Payment-Token: access_token"
 ```
-
-### 인증 에러
-
-| 코드 | 설명 |
-|------|------|
-| 401 | API 키 없음 또는 유효하지 않음 |
-| 403 | API 키 권한 부족 |
-
-## 수수료 구조
-
-| 구분 | 비율 |
-|------|------|
-| 애플리케이션 수수료 | 1% |
-| 네트워크 수수료 | 0.00001 XRP (XRPL 기본) |
 
 ## RLUSD Trust Line 설정 가이드
 
@@ -181,7 +291,6 @@ Trust Line은 XRPL에서 IOU 토큰(예: RLUSD)을 주고받기 위해 설정해
 ### Trust Line 확인
 
 ```bash
-# 특정 주소의 RLUSD trust line 확인
 curl "http://localhost:8000/payment/trustline/{address}" \
   -H "X-API-Key: your_api_key"
 ```
@@ -197,32 +306,10 @@ curl "http://localhost:8000/payment/trustline/{address}" \
 }
 ```
 
-**Response (Trust Line 있음):**
-```json
-{
-  "address": "rExampleAddress...",
-  "has_rlUSD_trustline": true,
-  "rlUSD_limit": 1000.0,
-  "rlUSD_balance": 50.0,
-  "message": "RLUSD trust line이 설정되어 있습니다."
-}
-```
-
 ### Trust Line 없는 경우 에러
 
-```bash
-# RLUSD 결제 시도 (수신자가 trust line 없음)
-curl -X POST "http://localhost:8000/payment/create" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your_api_key" \
-  -d '{
-    "recipient_address": "rReceiverWithoutTrustline...",
-    "amount": 100.0,
-    "currency": "RLUSD"
-  }'
-```
+RLUSD 결제 시 수신자가 trust line을 설정하지 않았다면 아래와 같은 에러가 반환됩니다:
 
-**Error Response:**
 ```json
 {
   "detail": "수신자가 RLUSD 토큰에 대한 trust line을 설정하지 않았습니다. 수신자가 먼저 RLUSD를 받을 수 있도록 trust line을 설정해야 합니다."
@@ -231,17 +318,30 @@ curl -X POST "http://localhost:8000/payment/create" \
 
 **해결 방법:** 수신자에게 위 Trust Line 설정 가이드를 공유하고 trust line을 설정하도록 안내하세요.
 
-**예시:** 100 XRP 또는 100 RLUSD 결제 시
-- 수수료: 1 (해당 통화)
-- 전송금액: 99 (해당 통화)
-
 ## Claude MCP 연동
 
 Claude AI가 XAgent Pay API를 직접 툴로 호출할 수 있습니다.
 
-### 설치
+### 설치 및 실행
 
-mcp_server.py를 Claude Desktop 설정에 추가:
+```bash
+# XAgent Pay API 서버 시작
+python main.py
+
+# MCP 서버 시작 (별도 터미널)
+python mcp_server.py
+```
+
+`.env`에 MCP가 사용할 API 키를 지정하세요:
+
+```bash
+MCP_API_KEY=your_api_key
+```
+
+### Claude Desktop 설정
+
+**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows:** `%APPDATA%/Claude/claude_desktop_config.json`
 
 ```json
 {
@@ -260,10 +360,10 @@ mcp_server.py를 Claude Desktop 설정에 추가:
 
 ### 사용 가능한 툴
 
-- **get_rates**: 지원 통화 및 수수료 조회
-- **create_payment**: XRP/RLUSD 결제 생성
-- **verify_payment**: 트랜잭션 검증
-- **check_trustline**: RLUSD Trust Line 확인
+- **get_rates** — 지원 통화 및 수수료 조회
+- **create_payment** — XRP/RLUSD 결제 생성
+- **verify_payment** — 트랜잭션 검증
+- **check_trustline** — RLUSD Trust Line 확인
 
 ### 데모
 
@@ -278,79 +378,25 @@ Claude AI가 직접 1 XRP 송금한 실제 결과:
 - [x] x402 토큰 지원
 - [x] RLUSD(스테이블코인) 지원
 - [x] MCP 서버 지원 (Claude AI 연동)
+- [x] 발급/폐기 가능한 API 키 + tier별 인증
+- [x] 사용량 대시보드
+- [x] Rate Limiting + 멀티 지갑 관리
+- [x] Webhook 알림
 - [ ] 추가 IOU 토큰 지원
 - [ ] 메인넷 배포
-- [ ] 웹훅 알림
 - [ ] 배치 결제
 
-## MCP 서버 (Claude AI 연동)
+## 알려진 제한사항
 
-XAgent Pay API를 Claude AI가 직접 사용할 수 있는 MCP 서버를 제공합니다.
-
-### 설치 및 설정
-
-```bash
-# MCP 패키지 설치
-pip install -r requirements.txt
-
-# .env 파일에 MCP API 키 설정
-MCP_API_KEY=your_api_key
-```
-
-### MCP 서버 실행
-
-```bash
-# XAgent Pay API 서버 시작
-python main.py
-
-# MCP 서버 시작 (다른 터미널)
-python mcp_server.py
-```
-
-### Claude Desktop 설정
-
-Claude Desktop 설정 파일에 다음 내용을 추가하세요:
-
-**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows:** `%APPDATA%/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "xagent-pay-api": {
-      "command": "python",
-      "args": ["C:/XRPL_MVP/mcp_server.py"],
-      "env": {
-        "XAGENT_PAY_API_URL": "http://localhost:8000",
-        "MCP_API_KEY": "your_api_key"
-      }
-    }
-  }
-}
-```
-
-### 사용 가능한 MCP 툴
-
-1. **create_payment** - XRP/RLUSD 결제 생성
-2. **verify_payment** - 결제 트랜잭션 검증
-3. **check_trustline** - RLUSD Trust Line 확인
-4. **get_rates** - 지원 통화 및 수수료 정보 조회
-
-### Claude에서 사용 예시
-
-```
-"100 XRP를 rAddress...로 전송해줘"
-"최신 결제 내역을 검증해줘"
-"RLUSD trust line을 확인해줘"
-"지원하는 통화와 수수료율 알려줘"
-```
+- 현재 API 키/트랜잭션/webhook 설정은 JSON 파일 기반으로 저장됩니다. 단일 프로세스(`--workers 1`) 기준으로 안전하며, 여러 워커/인스턴스로 스케일아웃하려면 SQLite 등으로 마이그레이션이 필요합니다 (자세한 내용은 [TODO_MIGRATION.md](TODO_MIGRATION.md) 참고).
+- 현재 테스트넷 전용입니다. 메인넷 전환 시 추가 보안 검토가 필요합니다.
 
 ## 보안
 
-**현재 테스트넷 전용**입니다. 메인넷 사용 시 보안 강화가 필요합니다:
-- 인증/인가 시스템
-- Rate Limiting
-- 시크릿 키 암호화 저장
+⚠️ **현재 테스트넷 전용**입니다. 메인넷 사용 시 아래를 추가로 검토하세요:
+- 시크릿 키(`SENDER_SECRET`, 지갑 seed) 암호화 저장
+- API 키/관리자 키 저장소를 SQLite 등으로 마이그레이션 후 접근 통제 강화
+- Webhook 대상 URL의 SSRF 방지 로직(현재 사설/루프백 IP 차단 적용됨) 및 DNS 리바인딩 방어 보강
 
 ## 라이선스
 

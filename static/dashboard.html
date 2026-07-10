@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XAgent Pay — 사용량 대시보드</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e38;
+    --text: #e6e8ec;
+    --muted: #8b909c;
+    --accent: #4f8cff;
+    --ok: #34c77b;
+    --warn: #f5a623;
+    --danger: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Pretendard, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 32px 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+
+  .keybar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 24px;
+  }
+  .keybar input {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: monospace;
+  }
+  .keybar button {
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: white;
+    padding: 10px 18px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .keybar button:hover { opacity: 0.9; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .card .value { font-size: 22px; font-weight: 600; }
+  .tier-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    text-transform: uppercase;
+    background: rgba(79, 140, 255, 0.15);
+    color: var(--accent);
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  td.mono { font-family: monospace; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+  .status-msg { padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
+  .status-msg.error { background: rgba(229, 72, 77, 0.12); color: var(--danger); }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>XAgent Pay — 사용량 대시보드</h1>
+  <div class="sub">API 키를 입력하면 quota, 누적 수수료, 트랜잭션 내역을 확인할 수 있습니다.</div>
+
+  <div class="keybar">
+    <input id="apiKey" type="password" placeholder="X-API-Key 값을 입력하세요 (예: xagent_...)" autocomplete="off">
+    <button id="loadBtn">조회</button>
+  </div>
+
+  <div id="statusMsg"></div>
+  <div id="content" style="display:none">
+    <div class="grid">
+      <div class="card">
+        <div class="label">Tier</div>
+        <div class="value"><span id="tierBadge" class="tier-badge">-</span></div>
+      </div>
+      <div class="card">
+        <div class="label">이번 달 요청 (<span id="monthLabel">-</span>)</div>
+        <div class="value" id="requestCount">-</div>
+      </div>
+      <div class="card">
+        <div class="label">남은 quota</div>
+        <div class="value" id="requestRemaining">-</div>
+      </div>
+      <div class="card">
+        <div class="label">누적 수수료</div>
+        <div class="value" id="cumulativeFees">-</div>
+      </div>
+    </div>
+
+    <div class="grid" style="grid-template-columns: 2fr 1fr;">
+      <div class="card">
+        <div class="label">지갑 주소 <span id="walletBadge" class="tier-badge" style="display:none"></span></div>
+        <div class="value" id="walletAddress" style="font-size:14px; font-family: monospace;">-</div>
+      </div>
+      <div class="card">
+        <div class="label">지갑 잔액</div>
+        <div class="value" id="walletBalance">-</div>
+      </div>
+    </div>
+
+    <h2>최근 트랜잭션</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>시간</th>
+          <th>엔드포인트</th>
+          <th>통화</th>
+          <th>금액</th>
+          <th>수수료</th>
+          <th>전송액</th>
+          <th>TX Hash</th>
+        </tr>
+      </thead>
+      <tbody id="txBody"></tbody>
+    </table>
+    <div id="txEmpty" class="empty" style="display:none">트랜잭션 내역이 없습니다.</div>
+  </div>
+</div>
+
+<script>
+const apiKeyInput = document.getElementById('apiKey');
+const loadBtn = document.getElementById('loadBtn');
+const statusMsg = document.getElementById('statusMsg');
+const content = document.getElementById('content');
+
+const saved = sessionStorage.getItem('xagent_api_key');
+if (saved) apiKeyInput.value = saved;
+
+async function loadDashboard() {
+  const apiKey = apiKeyInput.value.trim();
+  statusMsg.innerHTML = '';
+  if (!apiKey) {
+    statusMsg.innerHTML = '<div class="status-msg error">API 키를 입력해주세요.</div>';
+    return;
+  }
+
+  sessionStorage.setItem('xagent_api_key', apiKey);
+  loadBtn.disabled = true;
+  loadBtn.textContent = '조회 중...';
+
+  try {
+    const res = await fetch('/usage/dashboard?limit=50', {
+      headers: { 'X-API-Key': apiKey }
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      statusMsg.innerHTML = `<div class="status-msg error">${err.detail || ('조회 실패 (HTTP ' + res.status + ')')}</div>`;
+      content.style.display = 'none';
+      return;
+    }
+
+    const data = await res.json();
+    render(data);
+    content.style.display = 'block';
+
+    // 지갑 정보는 별도 엔드포인트 (실패해도 나머지 대시보드는 그대로 표시)
+    try {
+      const walletRes = await fetch('/wallet/info', { headers: { 'X-API-Key': apiKey } });
+      if (walletRes.ok) {
+        renderWallet(await walletRes.json());
+      }
+    } catch (e) {
+      // 지갑 조회 실패는 무시 (대시보드 핵심 정보는 이미 표시됨)
+    }
+  } catch (e) {
+    statusMsg.innerHTML = `<div class="status-msg error">네트워크 오류: ${e.message}</div>`;
+  } finally {
+    loadBtn.disabled = false;
+    loadBtn.textContent = '조회';
+  }
+}
+
+function renderWallet(wallet) {
+  document.getElementById('walletAddress').textContent = wallet.wallet_address;
+  document.getElementById('walletBalance').textContent = `${wallet.balance_xrp} XRP`;
+  const badge = document.getElementById('walletBadge');
+  badge.style.display = 'inline-block';
+  badge.textContent = wallet.dedicated ? '전용 지갑' : '공용 지갑';
+}
+
+function render(data) {
+  document.getElementById('tierBadge').textContent = data.tier;
+  document.getElementById('monthLabel').textContent = data.month;
+  document.getElementById('requestCount').textContent =
+    data.request_limit === null ? `${data.request_count}` : `${data.request_count} / ${data.request_limit}`;
+  document.getElementById('requestRemaining').textContent =
+    data.request_remaining === null ? '무제한' : data.request_remaining;
+
+  const fees = data.cumulative_fees || {};
+  const feeKeys = Object.keys(fees);
+  document.getElementById('cumulativeFees').textContent =
+    feeKeys.length === 0 ? '0' : feeKeys.map(c => `${fees[c]} ${c}`).join(', ');
+
+  const txBody = document.getElementById('txBody');
+  const txEmpty = document.getElementById('txEmpty');
+  txBody.innerHTML = '';
+
+  const txs = data.recent_transactions || [];
+  if (txs.length === 0) {
+    txEmpty.style.display = 'block';
+  } else {
+    txEmpty.style.display = 'none';
+    for (const tx of txs) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${new Date(tx.timestamp).toLocaleString('ko-KR')}</td>
+        <td>${tx.endpoint}</td>
+        <td>${tx.currency}</td>
+        <td>${tx.amount}</td>
+        <td>${tx.fee_amount}</td>
+        <td>${tx.sent_amount}</td>
+        <td class="mono">${tx.tx_hash.slice(0, 10)}...</td>
+      `;
+      txBody.appendChild(tr);
+    }
+  }
+}
+
+loadBtn.addEventListener('click', loadDashboard);
+apiKeyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') loadDashboard(); });
+
+if (saved) loadDashboard();
+</script>
+</body>
+</html>

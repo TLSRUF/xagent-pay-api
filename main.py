@@ -5,10 +5,10 @@ API 키 인증, 사용량 제한, 요청 로깅 포함
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field
 from xrpl.clients import WebsocketClient
-from xrpl.wallet import Wallet
+from xrpl.wallet import Wallet, generate_faucet_wallet
 from xrpl.models.transactions import Payment
 from xrpl.models.amounts import IssuedCurrencyAmount
 from xrpl.transaction import autofill_and_sign, submit
@@ -28,6 +28,12 @@ from functools import lru_cache
 import threading
 import jwt
 import secrets
+import hashlib
+import hmac
+import ipaddress
+import socket
+from urllib.parse import urlparse
+import httpx
 
 # 환경변수 로드
 load_dotenv()
@@ -44,7 +50,7 @@ SENDER_SECRET = os.getenv("SENDER_SECRET")
 FEE_ACCOUNT = os.getenv("FEE_ACCOUNT")
 XRPL_NODE = os.getenv("XRPL_NODE", "wss://s.altnet.rippletest.net:51233")
 API_KEYS = os.getenv("API_KEYS", "").split(",") if os.getenv("API_KEYS") else []
-MONTHLY_REQUEST_LIMIT = int(os.getenv("MONTHLY_REQUEST_LIMIT", "100"))
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")  # API 키 발급/폐기용 관리자 키
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))  # JWT 서명 키
 X402_PAYMENT_AMOUNT = float(os.getenv("X402_PAYMENT_AMOUNT", "0.1"))  # x402 결제 금액
 X402_FEE_ADDRESS = os.getenv("X402_FEE_ADDRESS", FEE_ACCOUNT)  # x402 수수료 수신 주소
@@ -57,6 +63,22 @@ RLUSD_CURRENCY = os.getenv("RLUSD_CURRENCY", "USD")  # RLUSD 통화 코드
 SUPPORTED_CURRENCIES = {
     "XRP": {"currency": "XRP", "issuer": None, "scale": 6},  # 1 XRP = 1,000,000 drops
     "RLUSD": {"currency": RLUSD_CURRENCY, "issuer": RLUSD_ISSUER, "scale": 5}  # 소수점 5자리
+}
+
+# tier별 월간 요청 한도 (None = 무제한)
+TIER_LIMITS: Dict[str, Optional[int]] = {
+    "free": int(os.getenv("FREE_MONTHLY_LIMIT", "100")),
+    "pro": None,
+    "enterprise": None
+}
+
+# tier별 결제 수수료율 (가격 정책: Free 1% / Pro $49/월 구독 + 0.15% / Enterprise 커스텀)
+# $49/월 구독료 자체는 별도 SaaS 과금 레이어(이 API 밖)에서 처리하고, 여기서는 트랜잭션당 수수료율만 적용한다.
+# Enterprise는 협의된 커스텀 요율을 키 발급 시 fee_rate로 지정해 이 기본값을 덮어쓸 수 있다.
+TIER_FEE_RATES: Dict[str, float] = {
+    "free": float(os.getenv("FREE_FEE_RATE", "0.01")),
+    "pro": float(os.getenv("PRO_FEE_RATE", "0.0015")),
+    "enterprise": float(os.getenv("ENTERPRISE_FEE_RATE", "0.0015"))
 }
 
 # 필수 환경변수 검증
@@ -118,10 +140,9 @@ logger = RequestLogger()
 # ============= 사용량 제한 시스템 =============
 
 class RateLimiter:
-    """API 키별 사용량 제한 시스템"""
+    """API 키별 사용량 제한 시스템 (한도는 tier별로 호출 시점에 전달)"""
 
-    def __init__(self, limit: int):
-        self.limit = limit
+    def __init__(self):
         self.usage_dir = Path("usage")
         self.lock = threading.Lock()
 
@@ -170,19 +191,416 @@ class RateLimiter:
 
             return usage_data
 
-    def check_rate_limit(self, api_key: str) -> tuple[bool, int]:
-        """사용량 제한 확인 (is_allowed, remaining_count)"""
+    def check_rate_limit(self, api_key: str, limit: Optional[int]) -> tuple[bool, Optional[int]]:
+        """사용량 제한 확인 (is_allowed, remaining_count). limit이 None이면 무제한."""
+        if limit is None:
+            return True, None
+
         usage_data = self.get_usage(api_key)
         current_count = usage_data["count"]
-        remaining = max(0, self.limit - current_count)
 
-        if current_count >= self.limit:
+        if current_count >= limit:
             return False, 0
 
+        remaining = max(0, limit - current_count)
         return True, remaining - 1  # 증가할 것을 고려해서 -1
 
 # 전역 Rate Limiter 인스턴스
-rate_limiter = RateLimiter(limit=MONTHLY_REQUEST_LIMIT)
+rate_limiter = RateLimiter()
+
+
+# ============= API 키 발급/조회/폐기 시스템 =============
+
+class APIKeyStore:
+    """발급/폐기 가능한 API 키 저장소 (JSON 파일 기반)
+
+    평문 키는 저장하지 않고 SHA-256 해시만 저장한다. 평문은 발급 시 1회만 응답으로 노출된다.
+    """
+
+    VALID_TIERS = ("free", "pro", "enterprise")
+
+    def __init__(self):
+        self.keys_dir = Path("keys")
+        self.keys_dir.mkdir(exist_ok=True)
+        self.store_file = self.keys_dir / "api_keys.json"
+        self.lock = threading.Lock()
+
+    def _hash_key(self, api_key: str) -> str:
+        return hashlib.sha256(api_key.encode()).hexdigest()
+
+    def _load(self) -> Dict:
+        if not self.store_file.exists():
+            return {}
+        try:
+            with open(self.store_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save(self, data: Dict):
+        with open(self.store_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def create_key(
+        self,
+        name: str,
+        tier: str,
+        wallet_address: Optional[str] = None,
+        wallet_seed: Optional[str] = None,
+        fee_rate: Optional[float] = None
+    ) -> Dict:
+        """새 API 키 발급. 평문 키는 이 응답에서만 확인 가능하다.
+
+        wallet_address/wallet_seed가 주어지면 이 키 전용 XRPL 지갑으로 결제가 실행된다.
+        생략되면 플랫폼 공용 지갑(SENDER_ADDRESS)을 사용한다 (레거시 동작).
+        fee_rate가 주어지면 tier 기본 요율(TIER_FEE_RATES) 대신 이 값을 사용한다 (Enterprise 커스텀 협의용).
+        """
+        if tier not in self.VALID_TIERS:
+            raise ValueError(f"유효하지 않은 tier: {tier}. 사용 가능: {self.VALID_TIERS}")
+
+        raw_key = "xagent_" + secrets.token_urlsafe(32)
+        key_hash = self._hash_key(raw_key)
+        key_id = "kid_" + secrets.token_hex(8)
+        now = datetime.now().isoformat()
+
+        record = {
+            "key_id": key_id,
+            "prefix": raw_key[:14] + "...",
+            "name": name,
+            "tier": tier,
+            "created_at": now,
+            "revoked": False,
+            "revoked_at": None,
+            "last_used_at": None,
+            "wallet_address": wallet_address,
+            "wallet_seed": wallet_seed,
+            "fee_rate": fee_rate
+        }
+
+        with self.lock:
+            data = self._load()
+            data[key_hash] = record
+            self._save(data)
+
+        return {"api_key": raw_key, **record}
+
+    def find_by_key(self, api_key: str) -> Optional[Dict]:
+        """평문 키로 저장된 레코드 조회 (해시 매칭)"""
+        key_hash = self._hash_key(api_key)
+        data = self._load()
+        record = data.get(key_hash)
+        if not record:
+            return None
+        return {"key_hash": key_hash, **record}
+
+    def touch_last_used(self, key_hash: str):
+        with self.lock:
+            data = self._load()
+            if key_hash in data:
+                data[key_hash]["last_used_at"] = datetime.now().isoformat()
+                self._save(data)
+
+    def revoke_key(self, key_id: str) -> bool:
+        """key_id로 키 폐기. 이미 폐기됐거나 존재하지 않으면 False."""
+        with self.lock:
+            data = self._load()
+            for record in data.values():
+                if record["key_id"] == key_id:
+                    if record["revoked"]:
+                        return False
+                    record["revoked"] = True
+                    record["revoked_at"] = datetime.now().isoformat()
+                    self._save(data)
+                    return True
+            return False
+
+    def list_keys(self) -> List[Dict]:
+        data = self._load()
+        return [{"key_hash": key_hash, **record} for key_hash, record in data.items()]
+
+    def migrate_legacy_keys(self, legacy_keys: List[str]):
+        """.env의 API_KEYS 목록을 신규 저장소로 마이그레이션 (하위 호환, tier=pro/무제한)"""
+        with self.lock:
+            data = self._load()
+            changed = False
+            for raw_key in legacy_keys:
+                raw_key = raw_key.strip()
+                if not raw_key:
+                    continue
+                key_hash = self._hash_key(raw_key)
+                if key_hash in data:
+                    continue
+                data[key_hash] = {
+                    "key_id": "kid_" + secrets.token_hex(8),
+                    "prefix": (raw_key[:14] + "...") if len(raw_key) > 14 else raw_key,
+                    "name": "legacy-env-key",
+                    "tier": "pro",
+                    "created_at": datetime.now().isoformat(),
+                    "revoked": False,
+                    "revoked_at": None,
+                    "last_used_at": None,
+                    "wallet_address": None,  # 레거시 키는 플랫폼 공용 지갑(SENDER_ADDRESS) 사용
+                    "wallet_seed": None,
+                    "fee_rate": None  # tier(pro) 기본 요율(TIER_FEE_RATES) 사용
+                }
+                changed = True
+            if changed:
+                self._save(data)
+
+# 전역 API 키 저장소 인스턴스 (기존 .env API_KEYS는 자동 마이그레이션)
+key_store = APIKeyStore()
+key_store.migrate_legacy_keys(API_KEYS)
+
+
+def compute_remaining_quota(api_key: str, current_count: int) -> Optional[int]:
+    """API 키의 tier 한도 기준 잔여 사용량 계산 (무제한이면 None)"""
+    key_record = key_store.find_by_key(api_key)
+    tier = key_record["tier"] if key_record else "free"
+    limit = TIER_LIMITS.get(tier, TIER_LIMITS["free"])
+    if limit is None:
+        return None
+    return max(0, limit - current_count)
+
+
+def resolve_sender_wallet(api_key: str) -> tuple[str, str]:
+    """API 키에 연결된 전용 지갑이 있으면 그 지갑을, 없으면 플랫폼 공용 지갑을 반환한다.
+
+    멀티 에이전트가 동시에 결제해도 지갑(=시퀀스 번호)이 분리되어 있어 충돌하지 않는다.
+    """
+    key_record = key_store.find_by_key(api_key)
+    if key_record and key_record.get("wallet_address") and key_record.get("wallet_seed"):
+        return key_record["wallet_address"], key_record["wallet_seed"]
+    return SENDER_ADDRESS, SENDER_SECRET
+
+
+def resolve_fee_rate(api_key: str) -> float:
+    """API 키의 결제 수수료율을 계산한다.
+
+    키에 커스텀 fee_rate(Enterprise 협의 요율)가 설정되어 있으면 그 값을,
+    아니면 tier 기본 요율(TIER_FEE_RATES)을 반환한다.
+    """
+    key_record = key_store.find_by_key(api_key)
+    if key_record and key_record.get("fee_rate") is not None:
+        return key_record["fee_rate"]
+    tier = key_record["tier"] if key_record else "free"
+    return TIER_FEE_RATES.get(tier, TIER_FEE_RATES["free"])
+
+
+# ============= 트랜잭션 내역 저장 시스템 (사용량 대시보드용) =============
+
+class TransactionStore:
+    """API 키별 트랜잭션 내역 저장 시스템 (JSONL, append-only)
+
+    누적 수수료·트랜잭션 내역 조회(사용량 대시보드)에 사용된다.
+    """
+
+    def __init__(self):
+        self.tx_dir = Path("usage") / "transactions"
+        self.tx_dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+
+    def _file_path(self, api_key: str) -> Path:
+        safe_key = api_key.replace("/", "_").replace("\\", "_")
+        return self.tx_dir / f"{safe_key}.jsonl"
+
+    def record(
+        self,
+        api_key: str,
+        endpoint: str,
+        tx_hash: str,
+        currency: str,
+        amount: float,
+        fee_amount: float,
+        sent_amount: float
+    ):
+        """성공한 결제 트랜잭션 1건 기록"""
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "endpoint": endpoint,
+            "tx_hash": tx_hash,
+            "currency": currency,
+            "amount": amount,
+            "fee_amount": fee_amount,
+            "sent_amount": sent_amount
+        }
+        with self.lock:
+            with open(self._file_path(api_key), "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def list_transactions(self, api_key: str, limit: int = 50) -> List[Dict]:
+        """최근 트랜잭션 내역 조회 (최신순)"""
+        path = self._file_path(api_key)
+        if not path.exists():
+            return []
+
+        entries = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+
+        return list(reversed(entries))[:limit]
+
+    def cumulative_fees(self, api_key: str) -> Dict[str, float]:
+        """통화별 누적 수수료 합계"""
+        path = self._file_path(api_key)
+        if not path.exists():
+            return {}
+
+        totals: Dict[str, float] = {}
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                currency = entry.get("currency", "XRP")
+                totals[currency] = totals.get(currency, 0.0) + entry.get("fee_amount", 0.0)
+
+        return {currency: round(total, 6) for currency, total in totals.items()}
+
+# 전역 트랜잭션 저장소 인스턴스
+tx_store = TransactionStore()
+
+
+# ============= Webhook 시스템 (트랜잭션 성공/실패 알림) =============
+
+WEBHOOK_RETRY_DELAYS = [2, 10, 60]  # 최초 시도 실패 후 재시도 간격(초)
+
+
+def validate_webhook_url(url: str):
+    """webhook URL 검증. 사설/루프백/링크로컬 대역은 SSRF 방지를 위해 거부한다."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="url은 http:// 또는 https:// 로 시작해야 합니다.")
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="유효하지 않은 URL입니다.")
+
+    try:
+        resolved = {info[4][0] for info in socket.getaddrinfo(parsed.hostname, None)}
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="URL의 호스트를 확인할 수 없습니다.")
+
+    for ip_str in resolved:
+        ip = ipaddress.ip_address(ip_str)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise HTTPException(
+                status_code=400,
+                detail="내부/사설 네트워크 주소는 webhook URL로 사용할 수 없습니다."
+            )
+
+
+class WebhookStore:
+    """API 키별 webhook 설정 및 전송 기록 저장 시스템 (JSON 파일 기반)"""
+
+    def __init__(self):
+        self.keys_dir = Path("keys")
+        self.keys_dir.mkdir(exist_ok=True)
+        self.store_file = self.keys_dir / "webhooks.json"
+        self.lock = threading.Lock()
+        self.delivery_dir = Path("usage") / "webhook_deliveries"
+        self.delivery_dir.mkdir(parents=True, exist_ok=True)
+
+    def _hash_key(self, api_key: str) -> str:
+        return hashlib.sha256(api_key.encode()).hexdigest()
+
+    def _load(self) -> Dict:
+        if not self.store_file.exists():
+            return {}
+        try:
+            with open(self.store_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save(self, data: Dict):
+        with open(self.store_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def set_webhook(self, api_key: str, url: str) -> Dict:
+        """webhook URL 등록/수정. 서명 검증용 secret을 새로 발급한다."""
+        key_hash = self._hash_key(api_key)
+        record = {
+            "url": url,
+            "secret": "whsec_" + secrets.token_urlsafe(24),
+            "updated_at": datetime.now().isoformat()
+        }
+        with self.lock:
+            data = self._load()
+            data[key_hash] = record
+            self._save(data)
+        return record
+
+    def get_webhook(self, api_key: str) -> Optional[Dict]:
+        key_hash = self._hash_key(api_key)
+        data = self._load()
+        return data.get(key_hash)
+
+    def delete_webhook(self, api_key: str) -> bool:
+        key_hash = self._hash_key(api_key)
+        with self.lock:
+            data = self._load()
+            if key_hash not in data:
+                return False
+            del data[key_hash]
+            self._save(data)
+            return True
+
+    def log_delivery(self, api_key: str, event: str, status: str, detail: str):
+        safe_key = api_key.replace("/", "_").replace("\\", "_")
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "event": event,
+            "status": status,  # "delivered" | "failed"
+            "detail": detail
+        }
+        with self.lock:
+            with open(self.delivery_dir / f"{safe_key}.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+# 전역 Webhook 저장소 인스턴스
+webhook_store = WebhookStore()
+
+
+async def dispatch_webhook_event(api_key: str, event: str, payload: Dict):
+    """트랜잭션 성공/실패 이벤트를 고객 webhook으로 전송한다 (백그라운드 실행, 재시도 포함).
+
+    호출부에서 await하지 않고 asyncio.create_task로 fire-and-forget 해야 API 응답이 지연되지 않는다.
+    """
+    webhook = webhook_store.get_webhook(api_key)
+    if not webhook:
+        return
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    signature = hmac.new(webhook["secret"].encode(), body, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-XAgent-Signature": f"sha256={signature}",
+        "X-XAgent-Event": event
+    }
+
+    last_error = "알 수 없는 오류"
+    attempt_delays = [0] + WEBHOOK_RETRY_DELAYS
+
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+        for attempt, delay in enumerate(attempt_delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                response = await client.post(webhook["url"], content=body, headers=headers)
+                if 200 <= response.status_code < 300:
+                    webhook_store.log_delivery(
+                        api_key, event, "delivered", f"HTTP {response.status_code} ({attempt}번째 시도)"
+                    )
+                    return
+                last_error = f"HTTP {response.status_code}"
+            except Exception as e:
+                last_error = str(e)
+
+    webhook_store.log_delivery(
+        api_key, event, "failed", f"{len(attempt_delays)}회 시도 후 실패: {last_error}"
+    )
 
 
 # ============= x402 액세스 토큰 시스템 =============
@@ -256,7 +674,9 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Ke
             detail="API 키가 필요합니다. X-API-Key 헤더를 포함해주세요."
         )
 
-    if x_api_key not in API_KEYS:
+    key_record = key_store.find_by_key(x_api_key)
+
+    if not key_record:
         # 요청 로깅
         logger.log_request(
             timestamp=datetime.now().isoformat(),
@@ -272,8 +692,27 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Ke
             detail="유효하지 않은 API 키입니다."
         )
 
-    # 사용량 제한 확인
-    is_allowed, remaining = rate_limiter.check_rate_limit(x_api_key)
+    if key_record["revoked"]:
+        # 요청 로깅
+        logger.log_request(
+            timestamp=datetime.now().isoformat(),
+            api_key=x_api_key,
+            endpoint="unknown",
+            method="unknown",
+            success=False,
+            status_code=403,
+            error_message="폐기된 API 키"
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="폐기된 API 키입니다."
+        )
+
+    tier = key_record["tier"]
+    limit = TIER_LIMITS.get(tier, TIER_LIMITS["free"])
+
+    # 사용량 제한 확인 (tier별 한도)
+    is_allowed, remaining = rate_limiter.check_rate_limit(x_api_key, limit)
 
     if not is_allowed:
         # 요청 로깅
@@ -284,14 +723,34 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Ke
             method="unknown",
             success=False,
             status_code=429,
-            error_message=f"월 사용량 초과 (제한: {MONTHLY_REQUEST_LIMIT}건)"
+            error_message=f"월 사용량 초과 (tier: {tier}, 제한: {limit}건)"
         )
         raise HTTPException(
             status_code=429,
-            detail=f"월 사용량을 초과했습니다. 제한: {MONTHLY_REQUEST_LIMIT}건/월"
+            detail=f"월 사용량을 초과했습니다. Tier: {tier}, 제한: {limit}건/월"
         )
 
+    key_store.touch_last_used(key_record["key_hash"])
+
     return x_api_key
+
+
+async def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")):
+    """관리자 키 검증 의존성 함수 (API 키 발급/폐기 등 관리 작업용)"""
+
+    if not ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="관리자 기능이 비활성화되어 있습니다. 서버에 ADMIN_API_KEY를 설정해주세요."
+        )
+
+    if not x_admin_key or not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(
+            status_code=403,
+            detail="유효하지 않은 관리자 키입니다."
+        )
+
+    return x_admin_key
 
 
 # 요청 모델 정의
@@ -334,6 +793,7 @@ class PaymentResponse(BaseModel):
     tx_hash: Optional[str] = None
     message: str
     fee_amount: Optional[float] = None
+    fee_rate: Optional[float] = None
     sent_amount: Optional[float] = None
     remaining_quota: Optional[int] = None
 
@@ -357,10 +817,92 @@ class PaymentStatus(BaseModel):
 class UsageInfo(BaseModel):
     """사용량 정보 모델"""
     api_key: str
+    tier: str
     month: str
     count: int
-    limit: int
-    remaining: int
+    limit: Optional[int] = None  # None = 무제한
+    remaining: Optional[int] = None  # None = 무제한
+
+class TransactionRecord(BaseModel):
+    """트랜잭션 내역 모델"""
+    timestamp: str
+    endpoint: str
+    tx_hash: str
+    currency: str
+    amount: float
+    fee_amount: float
+    sent_amount: float
+
+class UsageDashboard(BaseModel):
+    """사용량 대시보드 모델 (quota + 누적 수수료 + 최근 트랜잭션)"""
+    api_key: str
+    tier: str
+    month: str
+    request_count: int
+    request_limit: Optional[int] = None  # None = 무제한
+    request_remaining: Optional[int] = None  # None = 무제한
+    cumulative_fees: Dict[str, float]
+    recent_transactions: List[TransactionRecord]
+
+# API 키 관리 관련 모델
+class APIKeyIssueRequest(BaseModel):
+    """API 키 발급 요청 모델"""
+    name: str = Field(..., description="키 소유자/용도를 식별하는 라벨")
+    tier: str = Field(default="free", description="free, pro, enterprise 중 하나")
+    fee_rate: Optional[float] = Field(
+        default=None,
+        description="tier 기본 수수료율을 덮어쓸 커스텀 요율 (Enterprise 협의 요율 등). 생략 시 tier 기본값 사용."
+    )
+
+class APIKeyIssueResponse(BaseModel):
+    """API 키 발급 응답 모델 (평문 키는 이 응답에서만 확인 가능)"""
+    key_id: str
+    api_key: str
+    tier: str
+    fee_rate: float  # 실제 적용되는 수수료율 (커스텀 override 또는 tier 기본값)
+    wallet_address: Optional[str] = None  # 전용 지갑 발급 실패 시 None (플랫폼 공용 지갑 사용)
+    created_at: str
+    message: str
+
+class APIKeyInfo(BaseModel):
+    """API 키 메타데이터 모델 (평문 키/지갑 시드 미포함)"""
+    key_id: str
+    prefix: str
+    name: str
+    tier: str
+    fee_rate: float  # 실제 적용되는 수수료율 (커스텀 override 또는 tier 기본값)
+    revoked: bool
+    created_at: str
+    last_used_at: Optional[str] = None
+    wallet_address: Optional[str] = None
+
+class APIKeyRevokeResponse(BaseModel):
+    """API 키 폐기 응답 모델"""
+    success: bool
+    message: str
+
+class WalletInfo(BaseModel):
+    """API 키 전용 지갑 정보 모델"""
+    wallet_address: str
+    balance_xrp: float
+    dedicated: bool  # False면 플랫폼 공용 지갑을 공유해서 사용 중 (레거시 키)
+
+# Webhook 관련 모델
+class WebhookConfigRequest(BaseModel):
+    """Webhook 등록/수정 요청 모델"""
+    url: str = Field(..., description="트랜잭션 이벤트를 수신할 콜백 URL (http:// 또는 https://)")
+
+class WebhookConfigResponse(BaseModel):
+    """Webhook 등록/수정 응답 모델 (secret은 이 응답에서만 확인 가능)"""
+    url: str
+    secret: str
+    updated_at: str
+    message: str
+
+class WebhookInfo(BaseModel):
+    """Webhook 설정 조회 모델 (secret 미포함)"""
+    url: str
+    updated_at: str
 
 # x402 관련 모델
 class X402PaymentRequest(BaseModel):
@@ -429,7 +971,8 @@ async def create_payment(
     결제 생성 엔드포인트
 
     수신자 주소와 금액을 받아서 XRPL 테스트넷에 결제를 생성합니다.
-    XRP와 RLUSD 통화를 지원합니다. 전체 금액의 1%를 수수료로 차감하고, 나머지 금액을 수신자에게 전송합니다.
+    XRP와 RLUSD 통화를 지원합니다. API 키 tier별 수수료율(Free 1% / Pro·Enterprise 0.15% 기본)을
+    차감하고, 나머지 금액을 수신자에게 전송합니다.
 
     Headers:
         X-API-Key: (required) API 인증 키
@@ -456,8 +999,12 @@ async def create_payment(
                 detail=f"지원하지 않는 통화: {request.currency}. 지원 통화: {list(SUPPORTED_CURRENCIES.keys())}"
             )
 
-        # 수수료 계산 (1%)
-        fee_amount = request.amount * 0.01
+        # API 키 전용 지갑이 있으면 그 지갑을, 없으면 플랫폼 공용 지갑을 사용
+        sender_address, sender_secret = resolve_sender_wallet(api_key)
+
+        # tier별 수수료율 적용 (Free 1% / Pro·Enterprise 0.15% 기본, 커스텀 요율 override 가능)
+        fee_rate = resolve_fee_rate(api_key)
+        fee_amount = request.amount * fee_rate
         sent_amount = request.amount - fee_amount
 
         # 수수료와 전송 금액을 XRPL Amount 형식으로 변환
@@ -467,12 +1014,12 @@ async def create_payment(
         def create_payment_sync():
             # WebsocketClient 생성 및 연결 (동기적)
             with WebsocketClient(XRPL_NODE) as client:
-                # 발신자 지갑 생성
-                sender_wallet = Wallet.from_secret(SENDER_SECRET)
+                # 발신자 지갑 생성 (API 키 전용 지갑 또는 플랫폼 공용 지갑)
+                sender_wallet = Wallet.from_secret(sender_secret)
 
                 # 발신자 계정 정보 확인 (잔액 확인 등)
                 try:
-                    account_info_req = AccountInfo(account=SENDER_ADDRESS)
+                    account_info_req = AccountInfo(account=sender_address)
                     account_info = client.request(account_info_req)
                     balance = drops_to_xrp(int(account_info.result['account_data']['Balance']))
 
@@ -490,7 +1037,7 @@ async def create_payment(
                 # 수수료를 FEE_ACCOUNT로 전송하는 트랜잭션 (XRP만 해당)
                 if request.currency == "XRP" and fee_amount > 0:
                     fee_tx = Payment(
-                        account=SENDER_ADDRESS,
+                        account=sender_address,
                         destination=FEE_ACCOUNT,
                         amount=fee_amount_obj
                     )
@@ -513,7 +1060,7 @@ async def create_payment(
                         )
 
                 # 송신자와 수신자 주소 검증 (자신에게 전송 방지)
-                if SENDER_ADDRESS == request.recipient_address:
+                if sender_address == request.recipient_address:
                     raise HTTPException(
                         status_code=400,
                         detail="송신자와 수신자가 같습니다. 다른 주소로 전송해주세요."
@@ -522,7 +1069,7 @@ async def create_payment(
                 # 실제 결제 금액을 수신자에게 전송하는 트랜잭션
                 # IOU 토큰(RLUSD)은 send_max 없이 직접 전송 (IssuedCurrencyAmount 사용)
                 payment_tx = Payment(
-                    account=SENDER_ADDRESS,
+                    account=sender_address,
                     destination=request.recipient_address,
                     amount=sent_amount_obj
                 )
@@ -571,6 +1118,17 @@ async def create_payment(
             # 사용량 증가
             usage_data = rate_limiter.increment_usage(api_key)
 
+            # 트랜잭션 내역 기록 (사용량 대시보드용)
+            tx_store.record(
+                api_key=api_key,
+                endpoint=endpoint,
+                tx_hash=result["tx_hash"],
+                currency=request.currency,
+                amount=request.amount,
+                fee_amount=result["fee_amount"],
+                sent_amount=result["sent_amount"]
+            )
+
             # 성공 로깅
             logger.log_request(
                 timestamp=start_time.isoformat(),
@@ -582,8 +1140,25 @@ async def create_payment(
                 error_message=""
             )
 
+            # Webhook 알림 (백그라운드, 응답 지연 없음)
+            asyncio.create_task(dispatch_webhook_event(
+                api_key,
+                "payment.success",
+                {
+                    "event": "payment.success",
+                    "endpoint": endpoint,
+                    "tx_hash": result["tx_hash"],
+                    "currency": request.currency,
+                    "amount": request.amount,
+                    "fee_amount": result["fee_amount"],
+                    "sent_amount": result["sent_amount"],
+                    "timestamp": datetime.now().isoformat()
+                }
+            ))
+
             result["message"] = "결제가 성공적으로 생성되었습니다."
-            result["remaining_quota"] = max(0, MONTHLY_REQUEST_LIMIT - usage_data["count"])
+            result["fee_rate"] = fee_rate
+            result["remaining_quota"] = compute_remaining_quota(api_key, usage_data["count"])
 
             return PaymentResponse(**result)
 
@@ -602,6 +1177,20 @@ async def create_payment(
             error_message=error_message
         )
 
+        asyncio.create_task(dispatch_webhook_event(
+            api_key,
+            "payment.failed",
+            {
+                "event": "payment.failed",
+                "endpoint": endpoint,
+                "tx_hash": None,
+                "currency": request.currency,
+                "amount": request.amount,
+                "error": error_message,
+                "timestamp": datetime.now().isoformat()
+            }
+        ))
+
         raise
     except Exception as e:
         status_code = 500
@@ -617,6 +1206,20 @@ async def create_payment(
             status_code=status_code,
             error_message=error_message
         )
+
+        asyncio.create_task(dispatch_webhook_event(
+            api_key,
+            "payment.failed",
+            {
+                "event": "payment.failed",
+                "endpoint": endpoint,
+                "tx_hash": None,
+                "currency": request.currency,
+                "amount": request.amount,
+                "error": error_message,
+                "timestamp": datetime.now().isoformat()
+            }
+        ))
 
         raise HTTPException(
             status_code=500,
@@ -808,9 +1411,12 @@ async def get_payment_status(
                     unix_timestamp = xrpl_epoch + date
                     timestamp_str = datetime.fromtimestamp(unix_timestamp).strftime('%Y-%m-%d %H:%M:%S UTC')
 
-                # 애플리케이션 수수료 계산 (1%)
-                original_amount = amount / 0.99
-                app_fee = original_amount * 0.01
+                # 애플리케이션 수수료 추정치 (Free tier 기본 요율 기준)
+                # tier별 수수료율이 다르고 이 엔드포인트는 어떤 키가 이 tx를 생성했는지 알 수 없어
+                # 정확한 실제 수수료가 아닌 추정치이다. 정확한 값은 해당 키의 /usage/transactions를 참고.
+                free_fee_rate = TIER_FEE_RATES["free"]
+                original_amount = amount / (1 - free_fee_rate)
+                app_fee = original_amount * free_fee_rate
 
                 return PaymentStatus(
                     tx_hash=tx_hash,
@@ -883,9 +1489,13 @@ async def get_usage_info(api_key: str = Depends(verify_api_key)):
     start_time = datetime.now()
 
     try:
+        key_record = key_store.find_by_key(api_key)
+        tier = key_record["tier"] if key_record else "free"
+        limit = TIER_LIMITS.get(tier, TIER_LIMITS["free"])
+
         usage_data = rate_limiter.get_usage(api_key)
         current_count = usage_data["count"]
-        remaining = max(0, MONTHLY_REQUEST_LIMIT - current_count)
+        remaining = None if limit is None else max(0, limit - current_count)
 
         # 성공 로깅 (사용량 조회는 카운트하지 않음)
         logger.log_request(
@@ -900,9 +1510,10 @@ async def get_usage_info(api_key: str = Depends(verify_api_key)):
 
         return UsageInfo(
             api_key=api_key,
+            tier=tier,
             month=usage_data["month"],
             count=current_count,
-            limit=MONTHLY_REQUEST_LIMIT,
+            limit=limit,
             remaining=remaining
         )
 
@@ -924,6 +1535,313 @@ async def get_usage_info(api_key: str = Depends(verify_api_key)):
         )
 
 
+@app.get("/usage/transactions", response_model=List[TransactionRecord])
+async def get_usage_transactions(
+    limit: int = 50,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    트랜잭션 내역 조회 엔드포인트
+
+    현재 API 키로 생성된 결제 트랜잭션 내역을 최신순으로 반환합니다.
+
+    Headers:
+        X-API-Key: (required) API 인증 키
+
+    Args:
+        limit: 반환할 최대 건수 (기본 50)
+
+    Returns:
+        List[TransactionRecord]: 트랜잭션 내역 목록 (최신순)
+    """
+    limit = max(1, min(limit, 500))
+    return [TransactionRecord(**entry) for entry in tx_store.list_transactions(api_key, limit=limit)]
+
+
+@app.get("/usage/dashboard", response_model=UsageDashboard)
+async def get_usage_dashboard(
+    limit: int = 20,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    사용량 대시보드 엔드포인트
+
+    quota(tier/한도/잔여), 통화별 누적 수수료, 최근 트랜잭션 내역을 한 번에 반환합니다.
+    /dashboard 웹 페이지가 이 엔드포인트 하나로 화면을 구성합니다.
+
+    Headers:
+        X-API-Key: (required) API 인증 키
+
+    Args:
+        limit: 최근 트랜잭션 목록의 최대 건수 (기본 20)
+
+    Returns:
+        UsageDashboard: quota + 누적 수수료 + 최근 트랜잭션
+    """
+    limit = max(1, min(limit, 500))
+
+    key_record = key_store.find_by_key(api_key)
+    tier = key_record["tier"] if key_record else "free"
+    request_limit = TIER_LIMITS.get(tier, TIER_LIMITS["free"])
+
+    usage_data = rate_limiter.get_usage(api_key)
+    current_count = usage_data["count"]
+    remaining = None if request_limit is None else max(0, request_limit - current_count)
+
+    return UsageDashboard(
+        api_key=api_key,
+        tier=tier,
+        month=usage_data["month"],
+        request_count=current_count,
+        request_limit=request_limit,
+        request_remaining=remaining,
+        cumulative_fees=tx_store.cumulative_fees(api_key),
+        recent_transactions=[
+            TransactionRecord(**entry) for entry in tx_store.list_transactions(api_key, limit=limit)
+        ]
+    )
+
+
+# ============= 지갑 관리 =============
+
+@app.get("/wallet/info", response_model=WalletInfo)
+async def get_wallet_info(api_key: str = Depends(verify_api_key)):
+    """
+    지갑 정보 조회 엔드포인트
+
+    현재 API 키가 결제에 사용하는 XRPL 지갑 주소와 잔액을 반환합니다.
+    전용 지갑이 없는 레거시 키는 플랫폼 공용 지갑 정보를 반환합니다 (dedicated=false).
+
+    Headers:
+        X-API-Key: (required) API 인증 키
+
+    Returns:
+        WalletInfo: 지갑 주소, 잔액(XRP), 전용 지갑 여부
+    """
+    sender_address, _ = resolve_sender_wallet(api_key)
+    key_record = key_store.find_by_key(api_key)
+    dedicated = bool(key_record and key_record.get("wallet_address"))
+
+    def get_balance_sync():
+        with WebsocketClient(XRPL_NODE) as client:
+            account_info_req = AccountInfo(account=sender_address)
+            account_info = client.request(account_info_req)
+            if not account_info.is_successful():
+                raise HTTPException(status_code=404, detail="지갑 정보를 찾을 수 없습니다.")
+            return drops_to_xrp(int(account_info.result['account_data']['Balance']))
+
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as pool:
+        balance = await loop.run_in_executor(pool, get_balance_sync)
+
+    return WalletInfo(
+        wallet_address=sender_address,
+        balance_xrp=round(balance, 6),
+        dedicated=dedicated
+    )
+
+
+# ============= Webhook 관리 (셀프서브) =============
+
+@app.put("/webhook", response_model=WebhookConfigResponse)
+async def set_webhook(
+    request: WebhookConfigRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Webhook 등록/수정 엔드포인트
+
+    트랜잭션(payment/x402 결제) 성공·실패 시 지정한 URL로 이벤트를 POST합니다.
+    실패 시 2초/10초/60초 간격으로 최대 3회 재시도합니다.
+
+    등록할 때마다 서명 검증용 secret이 새로 발급되며, 이 응답에서만 확인할 수 있습니다.
+    수신 측에서는 X-XAgent-Signature 헤더(sha256=<hmac>)로 요청 위변조 여부를 검증하세요.
+
+    Headers:
+        X-API-Key: (required) API 인증 키
+
+    Args:
+        request: WebhookConfigRequest (url)
+
+    Returns:
+        WebhookConfigResponse: 등록된 URL과 서명 secret
+    """
+    validate_webhook_url(request.url)
+
+    record = webhook_store.set_webhook(api_key, request.url)
+
+    return WebhookConfigResponse(
+        url=record["url"],
+        secret=record["secret"],
+        updated_at=record["updated_at"],
+        message="Webhook이 등록되었습니다. secret은 다시 조회할 수 없으니 안전한 곳에 보관하세요."
+    )
+
+
+@app.get("/webhook", response_model=WebhookInfo)
+async def get_webhook(api_key: str = Depends(verify_api_key)):
+    """
+    현재 등록된 webhook 조회 엔드포인트 (secret은 노출되지 않음)
+
+    Headers:
+        X-API-Key: (required) API 인증 키
+
+    Returns:
+        WebhookInfo: 등록된 URL과 마지막 수정 시각
+    """
+    webhook = webhook_store.get_webhook(api_key)
+    if not webhook:
+        raise HTTPException(status_code=404, detail="등록된 webhook이 없습니다.")
+
+    return WebhookInfo(url=webhook["url"], updated_at=webhook["updated_at"])
+
+
+@app.delete("/webhook")
+async def remove_webhook(api_key: str = Depends(verify_api_key)):
+    """
+    Webhook 등록 해제 엔드포인트
+
+    Headers:
+        X-API-Key: (required) API 인증 키
+    """
+    success = webhook_store.delete_webhook(api_key)
+    if not success:
+        raise HTTPException(status_code=404, detail="등록된 webhook이 없습니다.")
+
+    return {"success": True, "message": "Webhook이 삭제되었습니다."}
+
+
+# ============= API 키 관리 엔드포인트 (관리자 전용) =============
+
+@app.post("/admin/keys", response_model=APIKeyIssueResponse)
+async def issue_api_key(
+    request: APIKeyIssueRequest,
+    _: str = Depends(verify_admin_key)
+):
+    """
+    API 키 발급 엔드포인트 (관리자 전용)
+
+    평문 키는 이 응답에서만 확인할 수 있으며, 서버에는 해시만 저장됩니다.
+    발급과 동시에 이 키 전용 XRPL 지갑을 생성하고 테스트넷 faucet으로 펀딩합니다.
+    이후 이 키로 실행하는 결제는 플랫폼 공용 지갑이 아닌 이 전용 지갑에서 나갑니다
+    (여러 에이전트가 동시에 결제해도 지갑이 분리되어 있어 시퀀스 충돌이 없습니다).
+    지갑 생성/펀딩이 실패하면 플랫폼 공용 지갑으로 자동 대체됩니다.
+
+    Headers:
+        X-Admin-Key: (required) 관리자 키
+
+    Args:
+        request: APIKeyIssueRequest (name, tier)
+
+    Returns:
+        APIKeyIssueResponse: 발급된 평문 API 키와 메타데이터 (지갑 주소 포함)
+    """
+    if request.tier not in APIKeyStore.VALID_TIERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"유효하지 않은 tier: {request.tier}. 사용 가능: {list(APIKeyStore.VALID_TIERS)}"
+        )
+
+    def create_agent_wallet_sync():
+        """전용 XRPL 지갑을 생성하고 테스트넷 faucet으로 펀딩. 실패하면 (None, None) 반환."""
+        try:
+            with WebsocketClient(XRPL_NODE) as client:
+                funded_wallet = generate_faucet_wallet(client)
+                return funded_wallet.address, funded_wallet.seed
+        except Exception as e:
+            print(f"경고: 전용 지갑 생성/펀딩 실패, 플랫폼 공용 지갑으로 대체합니다: {e}")
+            return None, None
+
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as pool:
+        wallet_address, wallet_seed = await loop.run_in_executor(pool, create_agent_wallet_sync)
+
+    result = key_store.create_key(
+        name=request.name,
+        tier=request.tier,
+        wallet_address=wallet_address,
+        wallet_seed=wallet_seed,
+        fee_rate=request.fee_rate
+    )
+
+    message = (
+        "API 키가 발급되었습니다. 이 키는 다시 조회할 수 없으니 안전한 곳에 보관하세요."
+        if wallet_address
+        else "API 키가 발급되었습니다. 전용 지갑 생성에 실패하여 플랫폼 공용 지갑을 사용합니다."
+    )
+
+    effective_fee_rate = request.fee_rate if request.fee_rate is not None else TIER_FEE_RATES.get(request.tier, TIER_FEE_RATES["free"])
+
+    return APIKeyIssueResponse(
+        key_id=result["key_id"],
+        api_key=result["api_key"],
+        tier=result["tier"],
+        fee_rate=effective_fee_rate,
+        wallet_address=wallet_address,
+        created_at=result["created_at"],
+        message=message
+    )
+
+
+@app.get("/admin/keys", response_model=List[APIKeyInfo])
+async def list_api_keys(_: str = Depends(verify_admin_key)):
+    """
+    발급된 API 키 목록 조회 엔드포인트 (관리자 전용)
+
+    평문 키는 노출되지 않으며, prefix와 메타데이터만 반환합니다.
+
+    Headers:
+        X-Admin-Key: (required) 관리자 키
+
+    Returns:
+        List[APIKeyInfo]: 발급된 API 키 메타데이터 목록
+    """
+    return [
+        APIKeyInfo(
+            key_id=record["key_id"],
+            prefix=record["prefix"],
+            name=record["name"],
+            tier=record["tier"],
+            fee_rate=record.get("fee_rate") if record.get("fee_rate") is not None else TIER_FEE_RATES.get(record["tier"], TIER_FEE_RATES["free"]),
+            revoked=record["revoked"],
+            created_at=record["created_at"],
+            last_used_at=record["last_used_at"],
+            wallet_address=record.get("wallet_address")
+        )
+        for record in key_store.list_keys()
+    ]
+
+
+@app.post("/admin/keys/{key_id}/revoke", response_model=APIKeyRevokeResponse)
+async def revoke_api_key(key_id: str, _: str = Depends(verify_admin_key)):
+    """
+    API 키 폐기 엔드포인트 (관리자 전용)
+
+    Headers:
+        X-Admin-Key: (required) 관리자 키
+
+    Args:
+        key_id: 폐기할 API 키의 key_id
+
+    Returns:
+        APIKeyRevokeResponse: 폐기 처리 결과
+
+    Raises:
+        HTTPException: key_id가 존재하지 않거나 이미 폐기된 경우
+    """
+    success = key_store.revoke_key(key_id)
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail="해당 key_id를 찾을 수 없거나 이미 폐기되었습니다."
+        )
+
+    return APIKeyRevokeResponse(
+        success=True,
+        message=f"API 키({key_id})가 폐기되었습니다."
+    )
+
+
 @app.get("/")
 async def root():
     """루트 엔드포인트 - API 정보"""
@@ -931,8 +1849,10 @@ async def root():
         "message": "XAgent Pay API Server",
         "version": "2.0.0",
         "features": {
-            "authentication": "API Key (X-API-Key header)",
-            "rate_limiting": f"{MONTHLY_REQUEST_LIMIT} requests/month per API key",
+            "authentication": "API Key (X-API-Key header), 발급/폐기 가능",
+            "tiers": {tier: (limit if limit is not None else "unlimited") for tier, limit in TIER_LIMITS.items()},
+            "fee_rates_by_tier": TIER_FEE_RATES,
+            "rate_limiting": "tier별 월간 요청 한도 (Free는 제한, Pro/Enterprise는 무제한)",
             "logging": "All requests logged to logs/ directory",
             "x402": "HTTP 402 Payment Required 표준 지원"
         },
@@ -941,12 +1861,28 @@ async def root():
             "GET /payment/verify/{tx_hash}": "결제 검증 (API 키 필요)",
             "GET /payment/status/{tx_hash}": "결제 상세 상태 조회 (API 키 필요)",
             "GET /usage/info": "사용량 정보 조회 (API 키 필요)",
+            "GET /usage/transactions": "트랜잭션 내역 조회 (API 키 필요)",
+            "GET /usage/dashboard": "사용량 대시보드 데이터 (API 키 필요)",
+            "GET /dashboard": "사용량 대시보드 웹 페이지",
+            "GET /wallet/info": "지갑 주소/잔액 조회 (API 키 필요)",
+            "PUT /webhook": "Webhook 등록/수정 (API 키 필요)",
+            "GET /webhook": "Webhook 조회 (API 키 필요)",
+            "DELETE /webhook": "Webhook 삭제 (API 키 필요)",
+            "POST /admin/keys": "API 키 발급 (관리자 키 필요)",
+            "GET /admin/keys": "API 키 목록 조회 (관리자 키 필요)",
+            "POST /admin/keys/{key_id}/revoke": "API 키 폐기 (관리자 키 필요)",
             "GET /data/market-info": "x402 결제 테스트 리소스 (결제 필요)",
             "POST /x402/pay": "x402 결제 토큰 발급",
             "GET /docs": "API 문서 (Swagger UI)",
             "GET /redoc": "API 문서 (ReDoc)"
         }
     }
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    """사용량 대시보드 웹 페이지 (API 키는 페이지 내에서 입력, /usage/dashboard 호출)"""
+    return FileResponse(Path("static") / "dashboard.html")
 
 
 @app.get("/health")
@@ -956,8 +1892,9 @@ async def health_check():
         "status": "healthy",
         "service": "XAgent Pay API",
         "version": "2.0.0",
-        "api_keys_configured": len(API_KEYS),
-        "rate_limit": f"{MONTHLY_REQUEST_LIMIT}/month",
+        "api_keys_issued": len(key_store.list_keys()),
+        "tier_limits": {tier: (limit if limit is not None else "unlimited") for tier, limit in TIER_LIMITS.items()},
+        "admin_endpoints_enabled": bool(ADMIN_API_KEY),
         "x402_enabled": True
     }
 
@@ -993,15 +1930,18 @@ async def create_x402_payment(
         # x402 결제는 고정 금액
         payment_amount = X402_PAYMENT_AMOUNT
 
+        # API 키 전용 지갑이 있으면 그 지갑을, 없으면 플랫폼 공용 지갑을 사용
+        sender_address, sender_secret = resolve_sender_wallet(api_key)
+
         def create_x402_payment_sync():
             # WebsocketClient 생성 및 연결 (동기적)
             with WebsocketClient(XRPL_NODE) as client:
-                # 발신자 지갑 생성
-                sender_wallet = Wallet.from_secret(SENDER_SECRET)
+                # 발신자 지갑 생성 (API 키 전용 지갑 또는 플랫폼 공용 지갑)
+                sender_wallet = Wallet.from_secret(sender_secret)
 
                 # 발신자 계정 정보 확인 (잔액 확인 등)
                 try:
-                    account_info_req = AccountInfo(account=SENDER_ADDRESS)
+                    account_info_req = AccountInfo(account=sender_address)
                     account_info = client.request(account_info_req)
                     balance = drops_to_xrp(int(account_info.result['account_data']['Balance']))
 
@@ -1018,7 +1958,7 @@ async def create_x402_payment(
 
                 # x402 결제 금액 전체를 FEE_ACCOUNT로 전송 (수수료 없음)
                 payment_tx = Payment(
-                    account=SENDER_ADDRESS,
+                    account=sender_address,
                     destination=X402_FEE_ADDRESS,
                     amount=str(xrp_to_drops(payment_amount))
                 )
@@ -1052,6 +1992,17 @@ async def create_x402_payment(
             # 사용량 증가
             usage_data = rate_limiter.increment_usage(api_key)
 
+            # 트랜잭션 내역 기록 (사용량 대시보드용)
+            tx_store.record(
+                api_key=api_key,
+                endpoint=endpoint,
+                tx_hash=result["tx_hash"],
+                currency="XRP",
+                amount=payment_amount,
+                fee_amount=result["fee_amount"],
+                sent_amount=result["sent_amount"]
+            )
+
             # 성공 로깅
             logger.log_request(
                 timestamp=start_time.isoformat(),
@@ -1063,8 +2014,24 @@ async def create_x402_payment(
                 error_message=""
             )
 
+            # Webhook 알림 (백그라운드, 응답 지연 없음)
+            asyncio.create_task(dispatch_webhook_event(
+                api_key,
+                "payment.success",
+                {
+                    "event": "payment.success",
+                    "endpoint": endpoint,
+                    "tx_hash": result["tx_hash"],
+                    "currency": "XRP",
+                    "amount": payment_amount,
+                    "fee_amount": result["fee_amount"],
+                    "sent_amount": result["sent_amount"],
+                    "timestamp": datetime.now().isoformat()
+                }
+            ))
+
             result["message"] = "x402 결제가 성공적으로 생성되었습니다."
-            result["remaining_quota"] = max(0, MONTHLY_REQUEST_LIMIT - usage_data["count"])
+            result["remaining_quota"] = compute_remaining_quota(api_key, usage_data["count"])
 
             return PaymentResponse(**result)
 
@@ -1083,6 +2050,20 @@ async def create_x402_payment(
             error_message=error_message
         )
 
+        asyncio.create_task(dispatch_webhook_event(
+            api_key,
+            "payment.failed",
+            {
+                "event": "payment.failed",
+                "endpoint": endpoint,
+                "tx_hash": None,
+                "currency": "XRP",
+                "amount": payment_amount,
+                "error": error_message,
+                "timestamp": datetime.now().isoformat()
+            }
+        ))
+
         raise
     except Exception as e:
         status_code = 500
@@ -1098,6 +2079,20 @@ async def create_x402_payment(
             status_code=status_code,
             error_message=error_message
         )
+
+        asyncio.create_task(dispatch_webhook_event(
+            api_key,
+            "payment.failed",
+            {
+                "event": "payment.failed",
+                "endpoint": endpoint,
+                "tx_hash": None,
+                "currency": "XRP",
+                "amount": payment_amount,
+                "error": error_message,
+                "timestamp": datetime.now().isoformat()
+            }
+        ))
 
         raise HTTPException(
             status_code=500,
@@ -1423,10 +2418,11 @@ async def get_supported_currencies():
     """
     지원 통화 목록 엔드포인트
 
-    현재 지원하는 통화 목록과 정보를 반환합니다.
+    현재 지원하는 통화 목록과 tier별 수수료율을 반환합니다.
+    실제 적용 요율은 API 키의 tier(및 커스텀 fee_rate override)에 따라 달라집니다.
 
     Returns:
-        dict: 지원 통화 정보
+        dict: 지원 통화 정보와 tier별 수수료율
 
     예시:
         {
@@ -1435,14 +2431,14 @@ async def get_supported_currencies():
                 "RLUSD": {"currency": "RLUSD", "issuer": "r...", "scale": 5}
             },
             "default_currency": "XRP",
-            "fee_rate": 0.01
+            "fee_rates_by_tier": {"free": 0.01, "pro": 0.0015, "enterprise": 0.0015}
         }
     """
     return {
         "supported_currencies": SUPPORTED_CURRENCIES,
         "default_currency": "XRP",
-        "fee_rate": 0.01,  # 1% 수수료
-        "message": "현재 XRP와 RLUSD 스테이블코인을 지원합니다"
+        "fee_rates_by_tier": TIER_FEE_RATES,
+        "message": "실제 적용 수수료율은 API 키의 tier에 따라 다릅니다 (Enterprise는 커스텀 협의 요율 적용 가능)"
     }
 
 
