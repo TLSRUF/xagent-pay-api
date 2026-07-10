@@ -973,6 +973,7 @@ async def create_payment(
     수신자 주소와 금액을 받아서 XRPL 테스트넷에 결제를 생성합니다.
     XRP와 RLUSD 통화를 지원합니다. API 키 tier별 수수료율(Free 1% / Pro·Enterprise 0.15% 기본)을
     차감하고, 나머지 금액을 수신자에게 전송합니다.
+    수수료는 본 결제 트랜잭션이 성공한 뒤에만 징수합니다 — 본 결제가 실패하면 수수료도 걷지 않습니다.
 
     Headers:
         X-API-Key: (required) API 인증 키
@@ -1034,39 +1035,17 @@ async def create_payment(
                         detail=f"계정 정보 조회 실패: {str(e)}"
                     )
 
-                # 수수료를 FEE_ACCOUNT로 전송하는 트랜잭션 (XRP만 해당)
-                if request.currency == "XRP" and fee_amount > 0:
-                    fee_tx = Payment(
-                        account=sender_address,
-                        destination=FEE_ACCOUNT,
-                        amount=fee_amount_obj
-                    )
-
-                    try:
-                        fee_tx_signed = autofill_and_sign(fee_tx, client, sender_wallet)
-                        fee_result = submit(fee_tx_signed, client)
-
-                        if fee_result.result.get('engine_result') != 'tesSUCCESS':
-                            raise HTTPException(
-                                status_code=500,
-                                detail=f"수수료 전송 실패: {fee_result.result.get('engine_result', 'Unknown')}"
-                            )
-                    except HTTPException:
-                        raise
-                    except Exception as e:
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"수수료 전송 중 오류 발생: {str(e)}"
-                        )
-
-                # 송신자와 수신자 주소 검증 (자신에게 전송 방지)
+                # 송신자와 수신자 주소 검증 (자신에게 전송 방지) — 트랜잭션 제출 전에 먼저 확인
                 if sender_address == request.recipient_address:
                     raise HTTPException(
                         status_code=400,
                         detail="송신자와 수신자가 같습니다. 다른 주소로 전송해주세요."
                     )
 
-                # 실제 결제 금액을 수신자에게 전송하는 트랜잭션
+                # 실제 결제 금액을 수신자에게 먼저 전송한다.
+                # 수수료는 이 트랜잭션이 성공한 뒤에만 징수한다 — 본 결제가 실패하면
+                # (예: 잔액 부족으로 두 번째 트랜잭션이 실패) 고객에게서 수수료만 떼이는
+                # 상황을 막기 위함이다.
                 # IOU 토큰(RLUSD)은 send_max 없이 직접 전송 (IssuedCurrencyAmount 사용)
                 payment_tx = Payment(
                     account=sender_address,
@@ -1080,16 +1059,7 @@ async def create_payment(
                 # 트랜잭션 제출
                 result = submit(payment_signed, client)
 
-                if result.result.get('engine_result') == 'tesSUCCESS':
-                    # 트랜잭션 해시 가져오기
-                    tx_hash = result.result.get('tx_json', {}).get('hash', result.result.get('hash', 'unknown'))
-                    return {
-                        "success": True,
-                        "tx_hash": tx_hash,
-                        "fee_amount": round(fee_amount, 6),
-                        "sent_amount": round(sent_amount, 6)
-                    }
-                else:
+                if result.result.get('engine_result') != 'tesSUCCESS':
                     engine_result = result.result.get('engine_result', 'Unknown')
 
                     # IOU 토큰 관련 에러 메시지 개선
@@ -1109,6 +1079,35 @@ async def create_payment(
                         status_code=500,
                         detail=f"트랜잭션 실패: {engine_result}"
                     )
+
+                # 본 결제 성공 — 트랜잭션 해시 가져오기
+                tx_hash = result.result.get('tx_json', {}).get('hash', result.result.get('hash', 'unknown'))
+
+                # 본 결제가 성공했을 때만 수수료를 FEE_ACCOUNT로 징수한다.
+                # 수수료 징수 자체가 실패해도 고객의 결제는 이미 성공했으므로 요청을 실패시키지 않는다
+                # (플랫폼의 수수료 미수취는 별도로 모니터링/재정산할 운영 이슈이지, 고객 피해가 아니다).
+                fee_collected = False
+                if fee_amount > 0:
+                    fee_tx = Payment(
+                        account=sender_address,
+                        destination=FEE_ACCOUNT,
+                        amount=fee_amount_obj
+                    )
+                    try:
+                        fee_tx_signed = autofill_and_sign(fee_tx, client, sender_wallet)
+                        fee_result = submit(fee_tx_signed, client)
+                        fee_collected = fee_result.result.get('engine_result') == 'tesSUCCESS'
+                        if not fee_collected:
+                            print(f"경고: 결제({tx_hash}) 성공, 수수료 징수 실패: {fee_result.result.get('engine_result', 'Unknown')}")
+                    except Exception as e:
+                        print(f"경고: 결제({tx_hash}) 성공, 수수료 징수 중 오류 발생: {e}")
+
+                return {
+                    "success": True,
+                    "tx_hash": tx_hash,
+                    "fee_amount": round(fee_amount, 6) if fee_collected else 0.0,
+                    "sent_amount": round(sent_amount, 6)
+                }
 
         # 스레드 풀에서 동기 함수 실행
         loop = asyncio.get_event_loop()
