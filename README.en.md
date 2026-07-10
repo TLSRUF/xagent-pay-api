@@ -393,8 +393,10 @@ Real result from Claude AI directly sending 1 XRP:
 
 ## Security
 
+- **Dedicated wallet seeds are encrypted at rest with `SECRET_ENCRYPTION_KEY` (Fernet).** Without this key, dedicated wallet creation is disabled entirely (never stored in plaintext). Never hardcode the master key — it's only read from `.env`.
+- `SENDER_SECRET` (the platform's shared wallet) is still stored in plaintext in `.env` — it's a bootstrap credential needed at server startup, outside this app's storage-encryption scope. Consider a KMS/Secrets Manager before mainnet.
+
 ⚠️ **Currently testnet-only.** For mainnet, additionally review:
-- Encrypted storage for secrets (`SENDER_SECRET`, wallet seeds)
 - Migrating API key/admin key storage to SQLite with stronger access control
 - Hardening the webhook SSRF guard (private/loopback IPs are currently blocked) against DNS rebinding
 

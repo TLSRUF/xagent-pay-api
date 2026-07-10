@@ -34,6 +34,7 @@ import ipaddress
 import socket
 from urllib.parse import urlparse
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 
 # 환경변수 로드
 load_dotenv()
@@ -51,6 +52,9 @@ FEE_ACCOUNT = os.getenv("FEE_ACCOUNT")
 XRPL_NODE = os.getenv("XRPL_NODE", "wss://s.altnet.rippletest.net:51233")
 API_KEYS = os.getenv("API_KEYS", "").split(",") if os.getenv("API_KEYS") else []
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")  # API 키 발급/폐기용 관리자 키
+# 지갑 시크릿(seed) 암호화 마스터 키. 절대 하드코딩하지 않는다 — 없으면 지갑 자동 생성 기능이
+# 비활성화되고 플랫폼 공용 지갑으로 대체된다 (평문 저장을 방지하기 위한 fail-safe).
+SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY")
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))  # JWT 서명 키
 X402_PAYMENT_AMOUNT = float(os.getenv("X402_PAYMENT_AMOUNT", "0.1"))  # x402 결제 금액
 X402_FEE_ADDRESS = os.getenv("X402_FEE_ADDRESS", FEE_ACCOUNT)  # x402 수수료 수신 주소
@@ -209,6 +213,42 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 
 
+# ============= 지갑 시크릿 암호화 =============
+
+class SecretCipher:
+    """지갑 시크릿(seed) 암호화/복호화 (Fernet, 대칭키).
+
+    마스터 키는 SECRET_ENCRYPTION_KEY 환경변수로만 주입받는다 (코드에 하드코딩 금지).
+    키가 없으면 enabled=False가 되고, 이 경우 호출부는 지갑 자동 생성을 건너뛰어야 한다 —
+    암호화할 수 없는 시크릿을 평문으로 저장하는 상황을 원천 차단하기 위함이다.
+    """
+
+    def __init__(self, key: Optional[str]):
+        self._fernet = Fernet(key.encode()) if key else None
+
+    @property
+    def enabled(self) -> bool:
+        return self._fernet is not None
+
+    def encrypt(self, plaintext: str) -> str:
+        if not self._fernet:
+            raise RuntimeError("SECRET_ENCRYPTION_KEY가 설정되지 않아 암호화할 수 없습니다.")
+        return self._fernet.encrypt(plaintext.encode()).decode()
+
+    def decrypt(self, ciphertext: str) -> str:
+        if not self._fernet:
+            raise RuntimeError("SECRET_ENCRYPTION_KEY가 설정되지 않아 복호화할 수 없습니다.")
+        try:
+            return self._fernet.decrypt(ciphertext.encode()).decode()
+        except InvalidToken:
+            raise RuntimeError("지갑 시크릿 복호화 실패 (SECRET_ENCRYPTION_KEY가 암호화 당시와 다릅니다).")
+
+# 전역 시크릿 암호화 인스턴스
+secret_cipher = SecretCipher(SECRET_ENCRYPTION_KEY)
+if not secret_cipher.enabled:
+    print("경고: SECRET_ENCRYPTION_KEY가 설정되지 않았습니다. API 키 발급 시 전용 지갑 자동 생성이 비활성화되고 플랫폼 공용 지갑을 사용합니다.")
+
+
 # ============= API 키 발급/조회/폐기 시스템 =============
 
 class APIKeyStore:
@@ -246,12 +286,13 @@ class APIKeyStore:
         name: str,
         tier: str,
         wallet_address: Optional[str] = None,
-        wallet_seed: Optional[str] = None,
+        wallet_seed_encrypted: Optional[str] = None,
         fee_rate: Optional[float] = None
     ) -> Dict:
         """새 API 키 발급. 평문 키는 이 응답에서만 확인 가능하다.
 
-        wallet_address/wallet_seed가 주어지면 이 키 전용 XRPL 지갑으로 결제가 실행된다.
+        wallet_address/wallet_seed_encrypted가 주어지면 이 키 전용 XRPL 지갑으로 결제가 실행된다.
+        wallet_seed_encrypted는 반드시 SecretCipher로 암호화된 값이어야 한다 (평문 저장 금지).
         생략되면 플랫폼 공용 지갑(SENDER_ADDRESS)을 사용한다 (레거시 동작).
         fee_rate가 주어지면 tier 기본 요율(TIER_FEE_RATES) 대신 이 값을 사용한다 (Enterprise 커스텀 협의용).
         """
@@ -273,7 +314,7 @@ class APIKeyStore:
             "revoked_at": None,
             "last_used_at": None,
             "wallet_address": wallet_address,
-            "wallet_seed": wallet_seed,
+            "wallet_seed_encrypted": wallet_seed_encrypted,
             "fee_rate": fee_rate
         }
 
@@ -340,7 +381,7 @@ class APIKeyStore:
                     "revoked_at": None,
                     "last_used_at": None,
                     "wallet_address": None,  # 레거시 키는 플랫폼 공용 지갑(SENDER_ADDRESS) 사용
-                    "wallet_seed": None,
+                    "wallet_seed_encrypted": None,
                     "fee_rate": None  # tier(pro) 기본 요율(TIER_FEE_RATES) 사용
                 }
                 changed = True
@@ -366,10 +407,15 @@ def resolve_sender_wallet(api_key: str) -> tuple[str, str]:
     """API 키에 연결된 전용 지갑이 있으면 그 지갑을, 없으면 플랫폼 공용 지갑을 반환한다.
 
     멀티 에이전트가 동시에 결제해도 지갑(=시퀀스 번호)이 분리되어 있어 충돌하지 않는다.
+    전용 지갑 시크릿은 저장소에 암호화된 상태로만 존재하므로 여기서 복호화한다.
     """
     key_record = key_store.find_by_key(api_key)
-    if key_record and key_record.get("wallet_address") and key_record.get("wallet_seed"):
-        return key_record["wallet_address"], key_record["wallet_seed"]
+    if key_record and key_record.get("wallet_address") and key_record.get("wallet_seed_encrypted"):
+        try:
+            wallet_seed = secret_cipher.decrypt(key_record["wallet_seed_encrypted"])
+            return key_record["wallet_address"], wallet_seed
+        except RuntimeError as e:
+            print(f"경고: 전용 지갑 시크릿 복호화 실패, 플랫폼 공용 지갑으로 대체합니다: {e}")
     return SENDER_ADDRESS, SENDER_SECRET
 
 
@@ -1724,7 +1770,9 @@ async def issue_api_key(
     발급과 동시에 이 키 전용 XRPL 지갑을 생성하고 테스트넷 faucet으로 펀딩합니다.
     이후 이 키로 실행하는 결제는 플랫폼 공용 지갑이 아닌 이 전용 지갑에서 나갑니다
     (여러 에이전트가 동시에 결제해도 지갑이 분리되어 있어 시퀀스 충돌이 없습니다).
-    지갑 생성/펀딩이 실패하면 플랫폼 공용 지갑으로 자동 대체됩니다.
+    지갑 시크릿은 SECRET_ENCRYPTION_KEY로 암호화되어 저장됩니다. 이 키가 서버에
+    설정되어 있지 않으면 지갑 생성 자체를 건너뛰고 플랫폼 공용 지갑으로 대체됩니다
+    (평문 저장을 방지하기 위한 안전장치). 지갑 생성/펀딩이 실패한 경우도 동일합니다.
 
     Headers:
         X-Admin-Key: (required) 관리자 키
@@ -1751,15 +1799,23 @@ async def issue_api_key(
             print(f"경고: 전용 지갑 생성/펀딩 실패, 플랫폼 공용 지갑으로 대체합니다: {e}")
             return None, None
 
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as pool:
-        wallet_address, wallet_seed = await loop.run_in_executor(pool, create_agent_wallet_sync)
+    wallet_address = None
+    wallet_seed_encrypted = None
+
+    if secret_cipher.enabled:
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            wallet_address, wallet_seed = await loop.run_in_executor(pool, create_agent_wallet_sync)
+        if wallet_address and wallet_seed:
+            wallet_seed_encrypted = secret_cipher.encrypt(wallet_seed)
+    else:
+        print("경고: SECRET_ENCRYPTION_KEY 미설정으로 전용 지갑 생성을 건너뜁니다 (플랫폼 공용 지갑 사용).")
 
     result = key_store.create_key(
         name=request.name,
         tier=request.tier,
         wallet_address=wallet_address,
-        wallet_seed=wallet_seed,
+        wallet_seed_encrypted=wallet_seed_encrypted,
         fee_rate=request.fee_rate
     )
 
