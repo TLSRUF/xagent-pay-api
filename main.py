@@ -19,6 +19,7 @@ import os
 from dotenv import load_dotenv
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
+from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json
@@ -1070,18 +1071,24 @@ async def create_payment(
                         account_info_req = AccountInfo(account=sender_address)
                         account_info = client.request(account_info_req)
                         balance = drops_to_xrp(int(account_info.result['account_data']['Balance']))
+                        if balance < request.amount:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"잔액 부족. 현재 {request.currency} 잔액: {balance:.6f}, 요청 금액: {request.amount:.6f}"
+                            )
                     else:
                         account_lines_req = AccountLines(account=sender_address, peer=RLUSD_ISSUER)
                         lines_response = client.request(account_lines_req)
                         lines = lines_response.result.get('lines', [])
                         matching_line = next((line for line in lines if line.get('currency') == RLUSD_CURRENCY), None)
-                        balance = float(matching_line['balance']) if matching_line else 0.0
+                        # 문자열로 온 trust line 잔액은 float 변환 시 경계값에서 오차가 날 수 있어 Decimal로 비교
+                        rlusd_balance = Decimal(matching_line['balance']) if matching_line else Decimal("0")
 
-                    if balance < request.amount:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"잔액 부족. 현재 {request.currency} 잔액: {balance:.6f}, 요청 금액: {request.amount:.6f}"
-                        )
+                        if rlusd_balance < Decimal(str(request.amount)):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"잔액 부족. 현재 {request.currency} 잔액: {rlusd_balance}, 요청 금액: {request.amount:.6f}"
+                            )
                 except HTTPException:
                     raise
                 except Exception as e:
