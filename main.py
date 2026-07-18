@@ -19,7 +19,7 @@ import os
 from dotenv import load_dotenv
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json
@@ -982,12 +982,14 @@ def validate_currency(currency: str) -> bool:
     return currency in SUPPORTED_CURRENCIES
 
 
-def create_amount(amount: float, currency: str):
+def create_amount(amount: Decimal, currency: str):
     """
     XRPL 트랜잭션용 Amount 객체 생성
 
     Args:
-        amount: 전송 금액
+        amount: 전송 금액 (Decimal — 호출부에서 통화별 정밀도로 이미 quantize된 값이어야 한다.
+                float로 계산하면 곱셈/뺄셈 과정의 반올림 오차로 유효숫자가 늘어나
+                XRPL이 IssuedCurrencyAmount를 거부하는 문제가 있어 Decimal만 받는다. 이슈 #8)
         currency: 통화 종류 (XRP 또는 RLUSD)
 
     Returns:
@@ -995,8 +997,9 @@ def create_amount(amount: float, currency: str):
         IOU 토큰의 경우: IssuedCurrencyAmount 객체
     """
     if currency == "XRP":
-        # XRP는 drops 단위의 문자열
-        return str(xrp_to_drops(amount))
+        # Decimal 자릿수를 그대로 옮겨 정수 drops로 변환 (float 곱셈을 거치지 않아 오차 없음)
+        drops = int(amount.scaleb(6))
+        return str(drops)
     elif currency == "RLUSD":
         # RLUSD는 IOU 토큰 형식 (IssuedCurrencyAmount 객체 사용)
         return IssuedCurrencyAmount(
@@ -1052,12 +1055,24 @@ async def create_payment(
 
         # tier별 수수료율 적용 (Free 1% / Pro·Enterprise 0.15% 기본, 커스텀 요율 override 가능)
         fee_rate = resolve_fee_rate(api_key)
-        fee_amount = request.amount * fee_rate
-        sent_amount = request.amount - fee_amount
+
+        # float로 계산하면 곱셈/뺄셈 반올림 오차로 유효숫자가 늘어나 XRPL이 IssuedCurrencyAmount를
+        # 거부하는 경우가 있어(이슈 #8) Decimal로 계산하고 통화별 정밀도(scale)로 quantize한다.
+        # 수수료는 내림 처리해 플랫폼이 의도한 요율보다 더 걷는 일이 없도록 한다.
+        currency_scale = SUPPORTED_CURRENCIES[request.currency]["scale"]
+        quantum = Decimal(1).scaleb(-currency_scale)
+        amount_decimal = Decimal(str(request.amount))
+        fee_rate_decimal = Decimal(str(fee_rate))
+
+        fee_amount_decimal = (amount_decimal * fee_rate_decimal).quantize(quantum, rounding=ROUND_DOWN)
+        sent_amount_decimal = (amount_decimal - fee_amount_decimal).quantize(quantum, rounding=ROUND_DOWN)
+
+        fee_amount = float(fee_amount_decimal)
+        sent_amount = float(sent_amount_decimal)
 
         # 수수료와 전송 금액을 XRPL Amount 형식으로 변환
-        fee_amount_obj = create_amount(fee_amount, request.currency)
-        sent_amount_obj = create_amount(sent_amount, request.currency)
+        fee_amount_obj = create_amount(fee_amount_decimal, request.currency)
+        sent_amount_obj = create_amount(sent_amount_decimal, request.currency)
 
         def create_payment_sync():
             # WebsocketClient 생성 및 연결 (동기적)
