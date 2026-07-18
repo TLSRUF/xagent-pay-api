@@ -1064,6 +1064,20 @@ async def create_payment(
         amount_decimal = Decimal(str(request.amount))
         fee_rate_decimal = Decimal(str(fee_rate))
 
+        # 통화가 지원하는 소수 자릿수보다 정밀한 요청은 조용히 잘라내지 않고 명확히 거부한다.
+        if -amount_decimal.as_tuple().exponent > currency_scale:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{request.currency}은(는) 소수점 {currency_scale}자리까지만 지원합니다. 요청 금액: {request.amount}"
+            )
+
+        # XRPL IssuedCurrencyAmount는 유효숫자 15자리까지만 허용 (XRP는 정수 drops라 해당 없음)
+        if request.currency != "XRP" and len(amount_decimal.as_tuple().digits) > 15:
+            raise HTTPException(
+                status_code=400,
+                detail=f"요청 금액의 유효숫자가 XRPL 한도(15자리)를 초과합니다: {request.amount}"
+            )
+
         fee_amount_decimal = (amount_decimal * fee_rate_decimal).quantize(quantum, rounding=ROUND_DOWN)
         sent_amount_decimal = (amount_decimal - fee_amount_decimal).quantize(quantum, rounding=ROUND_DOWN)
 
