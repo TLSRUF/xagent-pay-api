@@ -48,3 +48,35 @@
   목적이 아니라면 파일 기록 자체를 없애는 것도 고려 (지금은 디버깅용으로만 남아있음).
 - 여러 프로세스로 스케일아웃할 계획이 확정되면 SQLite WAL로도 부족할 수 있으니
   그때는 Redis(락/캐시)나 Postgres 전환도 같이 검토.
+
+---
+
+## xagent-dex-api 저장소 (참고 — 별도 레포, 이미 SQLite)
+
+`xagent-dex-api`는 상업화 기능을 처음부터 SQLite(`usage.db`, `aiosqlite`)로 구현해서
+위 마이그레이션 대상이 아니다. 다만 같은 "저장소 확장성" 관점에서 나중에 손볼
+포인트가 남아있어 참고용으로 같이 기록한다. **별도 레포라 이 문서의 트리거 조건이나
+착수 시점과는 무관 — 각자 독립적으로 판단할 것.**
+
+| 파일 | 테이블 | 현재 패턴 | 나중에 볼 것 |
+|---|---|---|---|
+| `app/api_keys.py` | `api_keys` | `key_hash` PK, 쿼리마다 `aiosqlite.connect()` 새로 열고 닫음 | 연결 풀 없음 — 요청량 늘면 connect/close 오버헤드 누적 |
+| `app/auth.py` | `api_usage` | 요청마다 insert, 월별 집계는 `datetime.utcnow()` 기준 | — |
+| `app/transactions.py` | `swap_transactions` | append-only, `WHERE key_hash = ? ORDER BY id DESC LIMIT ?` 인덱스 있음 | `datetime.now()`(로컬 시간) 사용 중 — `auth.py`는 UTC로 통일했는데 여기는 아직 안 맞음. 월 경계 집계에 안 쓰이는 테이블이라 지금은 안전하지만, 나중에 timestamp 기준 집계 추가하면 이 불일치부터 맞출 것 |
+| `app/webhooks.py` | `webhooks`, `webhook_deliveries` | 배달 로그 append-only, 무제한 증가 | 위와 동일하게 `datetime.now()` 사용 중 (UTC 아님). `webhook_deliveries`도 TransactionStore와 같은 이유로 archival 없이 계속 쌓임 |
+
+공통으로 볼 것:
+
+1. **WAL 모드 미설정** — 현재 `connect(DB_PATH)`에서 `PRAGMA journal_mode=WAL`을
+   따로 걸지 않았음. 지금은 단일 워커 + 쿼리당 짧은 연결이라 문제로 드러난 적
+   없지만, 동시 쓰기가 늘면 `database is locked` 에러의 원인이 될 수 있음.
+   `--workers N` 스케일아웃 논의가 나오면 Pay API의 SQLite 마이그레이션과
+   같은 타이밍에 WAL + `busy_timeout`을 같이 검토.
+2. **연결 풀 없음** — 모든 메서드가 매번 `async with connect(DB_PATH)`로 새
+   연결을 여는 구조. 요청량이 늘기 전까지는 무시 가능한 수준.
+3. **`swap_transactions` / `webhook_deliveries` / `api_usage` 무제한 증가** —
+   Pay API의 `TransactionStore`/`WebhookStore` 배달 로그와 동일한 성격의 문제.
+   활성 고객이 늘면 archival 또는 파티셔닝 검토.
+
+착수 트리거는 Pay API와 동일하게 보면 됨: 멀티 워커 배포, 유료 고객 두 자릿수,
+또는 대시보드/트랜잭션 조회가 눈에 띄게 느려질 때.
